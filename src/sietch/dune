@@ -1,0 +1,8 @@
+(include_subdirs unqualified)
+
+(library
+ (name sietch)
+ (libraries dune-private-libs.cache dune-private-libs.stdune logs
+   threads.posix)
+ (synopsis "Dune distributed binary artifacts cache")
+ (preprocess future_syntax))
