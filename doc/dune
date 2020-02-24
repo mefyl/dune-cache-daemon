@@ -1,0 +1,18 @@
+(rule
+ (with-stdout-to
+  sietch.1
+  (run %{bin:sietch} --help=groff)))
+
+(install
+ (section man)
+ (files sietch.1))
+
+(include sietch.inc)
+
+(rule
+ (alias runtest)
+ (mode promote)
+ (action
+  (with-stdout-to
+   sietch.inc
+   (run bash %{dep:update-man.sh} %{bin:sietch}))))

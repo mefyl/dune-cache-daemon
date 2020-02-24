@@ -1,4 +1,5 @@
 (executable
  (name sietch)
+ (public_name sietch)
  (libraries cmdliner sietch)
  (preprocess future_syntax))
