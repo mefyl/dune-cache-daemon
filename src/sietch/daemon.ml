@@ -6,12 +6,13 @@ open Cache.Messages
 open Result.O
 
 type client =
-  { fd : Unix.file_descr
-  ; peer : Unix.sockaddr
+  { cache : Cache.Local.t
+  ; common_metadata : Sexp.t list
+  ; distributed : (module Distributed.S)
+  ; fd : Unix.file_descr
   ; input : char Stream.t
   ; output : out_channel
-  ; common_metadata : Sexp.t list
-  ; cache : Cache.Local.t
+  ; peer : Unix.sockaddr
   ; version : version
   }
 
@@ -131,10 +132,18 @@ let client_thread (events, (client : client)) =
       let* msg = outgoing_message_of_sexp client.version sexp in
       match msg with
       | Promote { duplication; repository; files; key; metadata } ->
-        let+ () =
-          Cache.Local.promote client.cache files key
-            (metadata @ client.common_metadata)
-            ~repository ~duplication
+        let metadata = metadata @ client.common_metadata in
+        let+ metadata, _ =
+          Cache.Local.promote_sync client.cache files key metadata ~repository
+            ~duplication
+        in
+        let () =
+          (* distribute *)
+          let module D = (val client.distributed) in
+          match D.distribute key metadata with
+          | Result.Ok () -> ()
+          | Result.Error e ->
+            Logs.warn (fun m -> m "failed to distribute: %s" e)
         in
         client
       | SetBuildRoot root ->
@@ -269,13 +278,7 @@ let run ?(port_f = ignore) ?(port = 0) daemon =
         match
           let* version = negotiate_version my_versions fd input output in
           let client =
-            { fd
-            ; peer
-            ; input
-            ; output
-            ; version
-            ; common_metadata = []
-            ; cache =
+            { cache =
                 ( match
                     Cache.Local.make ?root:daemon.root
                       ~duplication_mode:Cache.Duplication_mode.Hardlink
@@ -283,6 +286,13 @@ let run ?(port_f = ignore) ?(port = 0) daemon =
                   with
                 | Result.Ok m -> m
                 | Result.Error e -> User_error.raise [ Pp.textf "%s" e ] )
+            ; common_metadata = []
+            ; distributed = Distributed.disabled
+            ; fd
+            ; input
+            ; output
+            ; peer
+            ; version
             }
           in
           let tid = Thread.create client_thread (daemon.events, client) in
