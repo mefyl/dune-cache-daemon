@@ -49,6 +49,8 @@ let _irmin (type t) cache
   ( module struct
     include Store
 
+    let compare_trees l r = Store.Tree.hash l = Store.Tree.hash r
+
     let v = Lwt_main.run store
 
     let find_or_create_tree tree path =
@@ -56,28 +58,51 @@ let _irmin (type t) cache
       |> Lwt.map (Option.value ~default:Store.Tree.empty)
 
     let distribute key (metadata : Metadata_file.t) =
+      let open Let_syntax (Lwt) in
       let insert (root : Store.tree option) =
         let root =
           match root with
           | None -> Store.Tree.empty
           | Some tree -> tree
-        and insert_file tree { File.digest; in_the_cache; _ } =
+        and insert_file (tree, count) { File.digest; in_the_cache; _ } =
           let contents = Io.read_file in_the_cache in
-          Store.Tree.add tree [ Digest.to_string digest ] contents
+          let+ new_tree =
+            Store.Tree.add tree [ Digest.to_string digest ] contents
+          in
+          let (_ : hash) = Store.Tree.hash new_tree in
+          if compare_trees new_tree tree then
+            (new_tree, count)
+          else (
+            Logs.debug (fun m ->
+                m "distribute data file %s" (Digest.to_string digest));
+            (new_tree, count + 1)
+          )
         in
-        let open Let_syntax (Lwt) in
-        let* tree_files =
+        let* tree_files, count =
           let* tree_files = find_or_create_tree root [ "files" ] in
-          Lwt_list.fold_left_s insert_file tree_files metadata.files
+          Lwt_list.fold_left_s insert_file (tree_files, 0) metadata.files
         in
-        let* tree_metadata =
+        let* tree_metadata, meta_changed =
           let* tree_metadata = find_or_create_tree root [ "meta" ] in
-          Store.Tree.add tree_metadata [ Digest.to_string key ]
-            (Metadata_file.to_string metadata)
+          let+ new_tree =
+            Store.Tree.add tree_metadata [ Digest.to_string key ]
+              (Metadata_file.to_string metadata)
+          in
+          if compare_trees new_tree tree_metadata then
+            (new_tree, false)
+          else (
+            Logs.debug (fun m ->
+                m "distribute metadata file %s" (Digest.to_string key));
+            (new_tree, true)
+          )
         in
-        let* root = Store.Tree.add_tree root [ "files" ] tree_files in
-        let* root = Store.Tree.add_tree root [ "meta" ] tree_metadata in
-        Lwt.return (Some root)
+
+        if meta_changed || count > 0 then
+          let* root = Store.Tree.add_tree root [ "files" ] tree_files in
+          let+ root = Store.Tree.add_tree root [ "meta" ] tree_metadata in
+          Some root
+        else
+          Lwt.return None
       and info () =
         let author = "dune-cache <https://github.com/ocaml/dune>"
         and date = Int64.of_float (Unix.gettimeofday ())
