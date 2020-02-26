@@ -8,5 +8,5 @@ module type S = sig
 
   val distribute : Key.t -> Local.Metadata_file.t -> (unit, string) Result.t
 
-  val prefetch : Key.t -> (int, string) Result.t
+  val prefetch : Key.t -> (unit, string) Result.t
 end

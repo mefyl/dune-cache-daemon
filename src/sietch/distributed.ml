@@ -3,6 +3,32 @@ open Cache
 include Distributed_intf
 module Metadata_file = Cache.Local.Metadata_file
 
+module type Monad = sig
+  type 'a t
+
+  module Infix : sig
+    val ( >>= ) : 'a t -> ('a -> 'b t) -> 'b t
+
+    val ( >|= ) : 'a t -> ('a -> 'b) -> 'b t
+  end
+end
+
+module Let_syntax (O : Monad) = struct
+  include O.Infix
+
+  let ( let* ) = ( >>= )
+
+  let ( let+ ) = ( >|= )
+end
+
+module Lwt_result = struct
+  include Lwt_result
+
+  type error = string
+
+  type nonrec 'a t = ('a, error) t
+end
+
 let disabled =
   ( module struct
     type t = unit
@@ -11,7 +37,7 @@ let disabled =
 
     let distribute _ _ = Result.Ok ()
 
-    let prefetch _ = Result.Ok 0
+    let prefetch _ = Result.Ok ()
   end : S )
 
 let _irmin (type t) cache
@@ -24,10 +50,6 @@ let _irmin (type t) cache
     include Store
 
     let v = Lwt_main.run store
-
-    let ( let* ) = Lwt.bind
-
-    let ( let+ ) = Lwt.Infix.( >|= )
 
     let find_or_create_tree tree path =
       Store.Tree.find_tree tree path
@@ -43,6 +65,7 @@ let _irmin (type t) cache
           let contents = Io.read_file in_the_cache in
           Store.Tree.add tree [ Digest.to_string digest ] contents
         in
+        let open Let_syntax (Lwt) in
         let* tree_files =
           let* tree_files = find_or_create_tree root [ "files" ] in
           Lwt_list.fold_left_s insert_file tree_files metadata.files
@@ -72,28 +95,43 @@ let _irmin (type t) cache
 
     let prefetch_data (metadata : Metadata_file.t) =
       let retrieve_file (f : File.t) =
+        let open Let_syntax (Lwt) in
         let path = Cache.Local.path_metadata cache f.digest in
-        let+ contents = Store.get v [ "files"; Digest.to_string f.digest ] in
-        Io.write_file ~binary:true path contents
+        if not (Path.exists path) then (
+          let+ contents = Store.get v [ "files"; Digest.to_string f.digest ] in
+          Logs.debug (fun m ->
+              m "retrieved data file %s" (Digest.to_string f.digest));
+          Io.write_file ~binary:true path contents
+        ) else
+          Lwt.return ()
       in
       Lwt_list.iter_p retrieve_file metadata.files
 
     let prefetch key =
-      let open Lwt.Infix in
+      let open Let_syntax (Lwt_result) in
       let retrieve =
-        Store.find v [ "meta"; Digest.to_string key ] >>= function
-        | None -> Lwt.return (Result.Ok 0)
-        | Some contents ->
-          let path = Cache.Local.path_metadata cache key in
-          if not (Path.exists path) then
-            match Metadata_file.of_string contents with
-            | Result.Ok metadata ->
-              let* () = prefetch_data metadata in
-              Io.write_file ~binary:false path contents;
-              Lwt.return (Result.Ok 1)
-            | Result.Error e -> Lwt.return (Result.Error e)
+        let path = Cache.Local.path_metadata cache key in
+        let* metadata =
+          if Path.exists path then
+            let f d = Some (d, None) in
+            Metadata_file.parse path |> Result.map ~f |> Lwt.return
           else
-            Lwt.return (Result.Ok 0)
+            let open Let_syntax (Lwt) in
+            Store.find v [ "meta"; Digest.to_string key ] >|= function
+            | None -> Result.Ok None
+            | Some contents ->
+              Logs.debug (fun m ->
+                  m "retrieved metadata file %s" (Digest.to_string key));
+              let f d = Some (d, Some contents) in
+              Metadata_file.of_string contents |> Result.map ~f
+        in
+        let open Let_syntax (Lwt) in
+        match metadata with
+        | None -> Result.Ok () |> Lwt.return
+        | Some (metadata, contents) ->
+          let* () = prefetch_data metadata in
+          Option.iter ~f:(Io.write_file ~binary:false path) contents;
+          Lwt.return (Result.Ok ())
       in
       Lwt_main.run retrieve
   end : S )
