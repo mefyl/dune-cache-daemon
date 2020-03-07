@@ -3,6 +3,6 @@
 (library
  (name sietch)
  (libraries dune-private-libs.cache dune-private-libs.stdune irmin irmin-mem
-   logs lwt lwt.unix threads.posix)
+   logs logs.fmt lwt lwt.unix threads.posix)
  (synopsis "Dune distributed binary artifacts cache")
  (preprocess future_syntax))

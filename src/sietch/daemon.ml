@@ -119,7 +119,7 @@ let peer_name s =
 
 let stop daemon = Evt.sync (Evt.send daemon.events Stop)
 
-let my_versions : version list = [ { major = 1; minor = 1 } ]
+let my_versions : version list = [ { major = 1; minor = 2 } ]
 
 let endpoint m = m.endpoint
 
@@ -131,6 +131,13 @@ let client_thread (events, (client : client)) =
     let handle_cmd (client : client) sexp =
       let* msg = outgoing_message_of_sexp client.version sexp in
       match msg with
+      | Hint keys ->
+        let+ () =
+          let module D = (val client.distributed) in
+          let f k = D.prefetch k in
+          Result.List.iter ~f keys
+        in
+        client
       | Promote { duplication; repository; files; key; metadata } ->
         let metadata = metadata @ client.common_metadata in
         let+ metadata, _ =
@@ -157,7 +164,6 @@ let client_thread (events, (client : client)) =
     in
     let input = client.input in
     let f () =
-      Logs.info (fun m -> m "accept client: %s" (peer_name client.peer));
       let rec handle client =
         match Stream.peek input with
         | None -> Logs.info (fun m -> m "%s: ended" (peer_name client.peer))
@@ -276,7 +282,11 @@ let run ?(port_f = ignore) ?(port = 0) daemon =
         let output = Unix.out_channel_of_descr fd
         and input = Stream.of_channel (Unix.in_channel_of_descr fd) in
         match
+          Logs.info (fun m -> m "accept new client %s" (peer_name peer));
           let* version = negotiate_version my_versions fd input output in
+          Logs.debug (fun m ->
+              m "negotiated protocol version %s"
+              @@ Cache.Messages.string_of_version version);
           let client =
             { cache =
                 ( match
@@ -319,6 +329,10 @@ let run ?(port_f = ignore) ?(port = 0) daemon =
   | exception Unix.Unix_error (errno, f, _) ->
     User_error.raise
       [ Pp.textf "unable to %s: %s\n" f (Unix.error_message errno) ]
+
+let () =
+  Logs.set_level (Some Logs.Debug);
+  Logs.set_reporter (Logs.format_reporter ())
 
 let daemon ~root ~config started =
   Path.mkdir_p root;

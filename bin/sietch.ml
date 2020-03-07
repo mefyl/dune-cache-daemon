@@ -99,11 +99,15 @@ let stop =
 let commands = [ start; stop ]
 
 let () =
+  let () =
+    Dune_util.Log.init
+      ~file:(Dune_util.Log.File.This (Path.of_string "/dev/stdout"))
+      ()
+  in
   try
     match Term.eval_choice default commands ~catch:false with
     | `Error _ -> exit 1
     | _ -> exit 0
   with exn ->
     let exn = Exn_with_backtrace.capture exn in
-    Report_error.report exn;
-    exit 1
+    Dune_util.Report_error.report exn
