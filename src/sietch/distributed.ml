@@ -2,6 +2,7 @@ open Stdune
 open Cache
 include Distributed_intf
 module Metadata_file = Cache.Local.Metadata_file
+module Log = Dune_util.Log
 
 module type Monad = sig
   type 'a t
@@ -73,8 +74,8 @@ let _irmin (type t) cache
           if compare_trees new_tree tree then
             (new_tree, count)
           else (
-            Logs.debug (fun m ->
-                m "distribute data file %s" (Digest.to_string digest));
+            Log.info
+              [ Pp.textf "distribute data file %s" (Digest.to_string digest) ];
             (new_tree, count + 1)
           )
         in
@@ -91,8 +92,8 @@ let _irmin (type t) cache
           if compare_trees new_tree tree_metadata then
             (new_tree, false)
           else (
-            Logs.debug (fun m ->
-                m "distribute metadata file %s" (Digest.to_string key));
+            Log.info
+              [ Pp.textf "distribute metadata file %s" (Digest.to_string key) ];
             (new_tree, true)
           )
         in
@@ -124,8 +125,8 @@ let _irmin (type t) cache
         let path = Cache.Local.path_metadata cache f.digest in
         if not (Path.exists path) then (
           let+ contents = Store.get v [ "files"; Digest.to_string f.digest ] in
-          Logs.debug (fun m ->
-              m "retrieved data file %s" (Digest.to_string f.digest));
+          Log.info
+            [ Pp.textf "retrieved data file %s" (Digest.to_string f.digest) ];
           Io.write_file ~binary:true path contents
         ) else
           Lwt.return ()
@@ -145,8 +146,8 @@ let _irmin (type t) cache
             Store.find v [ "meta"; Digest.to_string key ] >|= function
             | None -> Result.Ok None
             | Some contents ->
-              Logs.debug (fun m ->
-                  m "retrieved metadata file %s" (Digest.to_string key));
+              Log.info
+                [ Pp.textf "retrieved metadata file %s" (Digest.to_string key) ];
               let f d = Some (d, Some contents) in
               Metadata_file.of_string contents |> Result.map ~f
         in
