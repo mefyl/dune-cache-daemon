@@ -97,13 +97,12 @@ let _irmin (type t) cache
             (new_tree, true)
           )
         in
-
         if meta_changed || count > 0 then
           let* root = Store.Tree.add_tree root [ "files" ] tree_files in
           let+ root = Store.Tree.add_tree root [ "meta" ] tree_metadata in
           Some root
         else
-          Lwt.return None
+          Lwt.return (Some root)
       and info () =
         let author = "dune-cache <https://github.com/ocaml/dune>"
         and date = Int64.of_float (Unix.gettimeofday ())
@@ -119,47 +118,64 @@ let _irmin (type t) cache
       in
       Lwt_main.run store
 
-    let prefetch_data (metadata : Metadata_file.t) =
-      let retrieve_file (f : File.t) =
-        let open Let_syntax (Lwt) in
-        let path = Cache.Local.path_metadata cache f.digest in
-        if not (Path.exists path) then (
-          let+ contents = Store.get v [ "files"; Digest.to_string f.digest ] in
-          Log.info
-            [ Pp.textf "retrieved data file %s" (Digest.to_string f.digest) ];
-          Io.write_file ~binary:true path contents
-        ) else
-          Lwt.return ()
-      in
-      Lwt_list.iter_p retrieve_file metadata.files
+    let write_file ~binary path contents =
+      Path.mkdir_p @@ Path.parent_exn path;
+      Io.write_file ~binary path contents
 
-    let prefetch key =
+    let search_missing_file ~of_path ~of_string path dir key =
+      if Path.exists path then (
+        Log.info
+          [ Pp.textf "file already present locally: %s" (Digest.to_string key) ];
+        let f d = Some (d, None) in
+        of_path path |> Result.map ~f |> Lwt.return
+      ) else
+        let open Let_syntax (Lwt) in
+        Store.find v [ dir; Digest.to_string key ] >|= function
+        | None ->
+          Log.info
+            [ Pp.textf "file not found in the distributed cache: %s"
+                (Digest.to_string key)
+            ];
+          Result.Ok None
+        | Some contents ->
+          Log.info [ Pp.textf "retrieved file %s" (Digest.to_string key) ];
+          let f d = Some (d, Some contents) in
+          of_string contents |> Result.map ~f
+
+    let rec prefetch key =
       let open Let_syntax (Lwt_result) in
       let retrieve =
         let path = Cache.Local.path_metadata cache key in
         let* metadata =
-          if Path.exists path then
-            let f d = Some (d, None) in
-            Metadata_file.parse path |> Result.map ~f |> Lwt.return
-          else
-            let open Let_syntax (Lwt) in
-            Store.find v [ "meta"; Digest.to_string key ] >|= function
-            | None -> Result.Ok None
-            | Some contents ->
-              Log.info
-                [ Pp.textf "retrieved metadata file %s" (Digest.to_string key) ];
-              let f d = Some (d, Some contents) in
-              Metadata_file.of_string contents |> Result.map ~f
+          search_missing_file ~of_path:Metadata_file.parse
+            ~of_string:Metadata_file.of_string path "meta" key
         in
-        let open Let_syntax (Lwt) in
         match metadata with
         | None -> Result.Ok () |> Lwt.return
         | Some (metadata, contents) ->
           let* () = prefetch_data metadata in
-          Option.iter ~f:(Io.write_file ~binary:false path) contents;
+          Option.iter ~f:(write_file ~binary:false path) contents;
           Lwt.return (Result.Ok ())
       in
       Lwt_main.run retrieve
+
+    and prefetch_data (metadata : Metadata_file.t) =
+      let open Let_syntax (Lwt_result) in
+      let retrieve_file (f : File.t) =
+        let path = Cache.Local.path_data cache f.digest in
+        let+ contents =
+          search_missing_file
+            ~of_path:(fun _ -> Result.Ok ())
+            ~of_string:(fun _ -> Result.Ok ())
+            path "files" f.digest
+        in
+        match contents with
+        | Some ((), Some contents) -> write_file ~binary:true path contents
+        | _ -> ()
+      in
+      let open Let_syntax (Lwt) in
+      let+ results = Lwt_list.map_p retrieve_file metadata.files in
+      Result.List.all results |> Result.map ~f:ignore
   end : S )
 
 let irmin local =

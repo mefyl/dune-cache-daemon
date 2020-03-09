@@ -10,7 +10,6 @@ open Pp.O
 type client =
   { cache : Cache.Local.t
   ; common_metadata : Sexp.t list
-  ; distributed : (module Distributed.S)
   ; fd : Unix.file_descr
   ; input : char Stream.t
   ; output : out_channel
@@ -87,6 +86,7 @@ type t =
   ; config : config
   ; events : event Evt.channel
   ; cache : Cache.Local.t
+  ; distributed : (module Distributed.S)
   }
 
 exception Error of string
@@ -107,6 +107,7 @@ let make ?root ~config () : t =
     ; config
     ; events = Evt.new_channel ()
     ; cache
+    ; distributed = Distributed.irmin cache
     }
 
 let getsockname = function
@@ -128,14 +129,15 @@ let endpoint m = m.endpoint
 let client_handle version output = function
   | Cache.Dedup f -> send version output (Dedup f)
 
-let client_thread (events, (client : client)) =
+let client_thread (daemon, (client : client)) =
+  let events = daemon.events in
   try
     let handle_cmd (client : client) sexp =
       let* msg = outgoing_message_of_sexp client.version sexp in
       match msg with
       | Hint keys ->
         let+ () =
-          let module D = (val client.distributed) in
+          let module D = (val daemon.distributed) in
           let f k = D.prefetch k in
           Result.List.iter ~f keys
         in
@@ -148,7 +150,7 @@ let client_thread (events, (client : client)) =
         in
         let () =
           (* distribute *)
-          let module D = (val client.distributed) in
+          let module D = (val daemon.distributed) in
           match D.distribute key metadata with
           | Result.Ok () -> ()
           | Result.Error e -> Log.info [ Pp.textf "failed to distribute: %s" e ]
@@ -199,6 +201,7 @@ let client_thread (events, (client : client)) =
           Unix.shutdown client.fd Unix.SHUTDOWN_ALL;
           Unix.close client.fd
         with Unix.Unix_error (Unix.ENOTCONN, _, _) -> () );
+      Cache.Local.teardown client.cache;
       Evt.sync (Evt.send events (Client_left client.fd))
     in
     try Exn.protect ~f ~finally with
@@ -271,15 +274,18 @@ let run ?(port_f = ignore) ?(port = 0) daemon =
       Some (Thread.create (trim_thread trim_size trim_period) daemon.cache);
     let rec handle () =
       let stop () =
-        match daemon.socket with
-        | Some fd ->
-          daemon.socket <- None;
-          let clean f = ignore (Clients.iter ~f daemon.clients) in
-          clean (fun (client, _) -> Unix.shutdown client.fd Unix.SHUTDOWN_ALL);
-          clean (fun (_, tid) -> Thread.join tid);
-          clean (fun (client, _) -> Unix.close client.fd);
-          Unix.close fd
-        | _ -> Log.info [ Pp.textf "stop" ]
+        let () =
+          match daemon.socket with
+          | Some fd ->
+            daemon.socket <- None;
+            let clean f = ignore (Clients.iter ~f daemon.clients) in
+            clean (fun (client, _) -> Unix.shutdown client.fd Unix.SHUTDOWN_ALL);
+            clean (fun (_, tid) -> Thread.join tid);
+            clean (fun (client, _) -> Unix.close client.fd);
+            Unix.close fd
+          | _ -> Log.info [ Pp.textf "stop" ]
+        in
+        Cache.Local.teardown daemon.cache
       in
       ( match Evt.sync (Evt.receive daemon.events) with
       | Stop -> stop ()
@@ -294,24 +300,18 @@ let run ?(port_f = ignore) ?(port = 0) daemon =
               @@ Cache.Messages.string_of_version version
             ];
           let client =
-            { cache =
-                ( match
-                    Cache.Local.make ?root:daemon.root
-                      ~duplication_mode:Cache.Duplication_mode.Hardlink
-                      (client_handle version output)
-                  with
-                | Result.Ok m -> m
-                | Result.Error e -> User_error.raise [ Pp.textf "%s" e ] )
-            ; common_metadata = []
-            ; distributed = Distributed.disabled
-            ; fd
-            ; input
-            ; output
-            ; peer
-            ; version
-            }
+            let cache =
+              match
+                Cache.Local.make ?root:daemon.root
+                  ~duplication_mode:Cache.Duplication_mode.Hardlink
+                  (client_handle version output)
+              with
+              | Result.Ok m -> m
+              | Result.Error e -> User_error.raise [ Pp.textf "%s" e ]
+            in
+            { cache; common_metadata = []; fd; input; output; peer; version }
           in
-          let tid = Thread.create client_thread (daemon.events, client) in
+          let tid = Thread.create client_thread (daemon, client) in
           let+ clients =
             Result.map_error
               ~f:(fun _ -> "duplicate socket")
