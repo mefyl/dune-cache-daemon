@@ -77,7 +77,7 @@ type event =
   | Client_left of Unix.file_descr
 
 type t =
-  { root : Path.t option
+  { root : Path.t
   ; mutable socket : Unix.file_descr option
   ; mutable clients : (client * Thread.t) Clients.t
   ; mutable endpoint : string option
@@ -98,7 +98,7 @@ let make ?root ~config () : t =
   with
   | Result.Error msg -> User_error.raise [ Pp.text msg ]
   | Result.Ok cache ->
-    { root
+    { root = Option.value root ~default:(Cache.Local.default_root ())
     ; socket = None
     ; clients = Clients.empty
     ; endpoint = None
@@ -157,8 +157,8 @@ let client_thread (daemon, (client : client)) =
         in
         client
       | SetBuildRoot root ->
-        Result.Ok
-          { client with cache = Cache.Local.set_build_dir client.cache root }
+        let+ cache = Cache.Local.set_build_dir client.cache root in
+        { client with cache }
       | SetCommonMetadata metadata ->
         Result.ok { client with common_metadata = metadata }
       | SetRepos repositories ->
@@ -302,7 +302,7 @@ let run ?(port_f = ignore) ?(port = 0) daemon =
           let client =
             let cache =
               match
-                Cache.Local.make ?root:daemon.root
+                Cache.Local.make ~root:daemon.root
                   ~duplication_mode:Cache.Duplication_mode.Hardlink
                   (client_handle version output)
               with
