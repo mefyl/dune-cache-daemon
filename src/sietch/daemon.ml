@@ -336,9 +336,7 @@ let run ?(port_f = ignore) ?(port = 0) daemon =
     User_error.raise
       [ Pp.textf "unable to %s: %s\n" f (Unix.error_message errno) ]
 
-let () =
-  Logs.set_level (Some Logs.Debug);
-  Logs.set_reporter (Logs.format_reporter ())
+let () = Logs.set_reporter (Logs.format_reporter ())
 
 let daemon ~root ~config started =
   Path.mkdir_p root;
