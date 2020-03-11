@@ -46,13 +46,16 @@ let _irmin (type t) cache
       with type t = t
        and type step = string
        and type key = string list
-       and type contents = string) (store : t Lwt.t) =
+       and type contents = string
+       and type metadata = bool) (store : t Lwt.t) =
   ( module struct
     include Store
 
     let compare_trees l r = Store.Tree.hash l = Store.Tree.hash r
 
     let v = Lwt_main.run store
+
+    let tmp = Cache.Local.path_tmp cache "sietch"
 
     let find_or_create_tree tree path =
       Store.Tree.find_tree tree path
@@ -65,10 +68,24 @@ let _irmin (type t) cache
           match root with
           | None -> Store.Tree.empty
           | Some tree -> tree
-        and insert_file (tree, count) { File.digest; in_the_cache; _ } =
-          let contents = Io.read_file in_the_cache in
+        and insert_file (tree, count)
+            { File.digest; in_the_cache; in_the_build_directory } =
+          let stats = Path.stat in_the_cache in
+          let checksum =
+            Stdune.Digest.file_with_stats in_the_cache stats
+            |> Stdune.Digest.to_string
+          and basename = Path.basename in_the_cache in
+          if checksum ^ ".1" <> basename then
+            Stdune.User_warning.emit
+              [ Pp.textf "checksum mismatch for %s: %s <> %s"
+                  (Path.Local.to_string
+                     (Path.Build.local in_the_build_directory))
+                  checksum basename
+              ];
+          let contents = Io.read_file in_the_cache
+          and metadata = stats.st_perm land 0o100 != 0 in
           let+ new_tree =
-            Store.Tree.add tree [ Digest.to_string digest ] contents
+            Store.Tree.add tree ~metadata [ Digest.to_string digest ] contents
           in
           let (_ : hash) = Store.Tree.hash new_tree in
           if compare_trees new_tree tree then
@@ -118,9 +135,22 @@ let _irmin (type t) cache
       in
       Lwt_main.run store
 
-    let write_file ~binary path contents =
+    let write_file ~binary path (contents, executable) =
+      let path_tmp = Path.relative tmp (Path.basename path)
+      and mode =
+        if executable then
+          0o500
+        else
+          0o400
+      in
+      Io.write_file ~binary path_tmp contents;
+      Path.chmod ~mode path_tmp;
       Path.mkdir_p @@ Path.parent_exn path;
-      Io.write_file ~binary path contents
+      Path.rename path_tmp path;
+      Log.info [ Pp.textf "FLM %s" (Path.to_string path) ];
+      if Path.basename path = "c8cffeb4e7b22f2986fe18cffad646b1.1" then
+        Log.info
+          [ Pp.textf "FUCK MY LIFE OK %s" (Io.read_file ~binary:true path) ]
 
     let search_missing_file ~of_path ~of_string path dir key =
       if Path.exists path then (
@@ -130,16 +160,16 @@ let _irmin (type t) cache
         of_path path |> Result.map ~f |> Lwt.return
       ) else
         let open Let_syntax (Lwt) in
-        Store.find v [ dir; Digest.to_string key ] >|= function
+        Store.find_all v [ dir; Digest.to_string key ] >|= function
         | None ->
           Log.info
             [ Pp.textf "file not found in the distributed cache: %s"
                 (Digest.to_string key)
             ];
           Result.Ok None
-        | Some contents ->
+        | Some (contents, metadata) ->
           Log.info [ Pp.textf "retrieved file %s" (Digest.to_string key) ];
-          let f d = Some (d, Some contents) in
+          let f d = Some (d, Some (contents, metadata)) in
           of_string contents |> Result.map ~f
 
     let rec prefetch key =
@@ -169,8 +199,19 @@ let _irmin (type t) cache
             ~of_string:(fun _ -> Result.Ok ())
             path "files" f.digest
         in
+        let path = Path.of_string (Path.to_string path ^ ".1") in
         match contents with
-        | Some ((), Some contents) -> write_file ~binary:true path contents
+        | Some ((), Some contents) ->
+          write_file ~binary:true path contents;
+          let checksum = Stdune.Digest.file_with_stats path (Path.stat path) in
+          if checksum <> f.digest then
+            Stdune.User_warning.emit
+              [ Pp.textf "checksum mismatch for %s: %s <> %s"
+                  (Path.Local.to_string
+                     (Path.Build.local f.in_the_build_directory))
+                  (Digest.to_string checksum)
+                  (Digest.to_string f.digest)
+              ]
         | _ -> ()
       in
       let open Let_syntax (Lwt) in
@@ -178,8 +219,27 @@ let _irmin (type t) cache
       Result.List.all results |> Result.map ~f:ignore
   end : S )
 
+module Metadata = struct
+  type t = bool
+
+  let t = Irmin.Type.bool
+
+  let default = false
+
+  let merge =
+    Irmin.Merge.v t (fun ~old:_ l r ->
+        if l = r then
+          Irmin.Merge.ok l
+        else
+          Irmin.Merge.conflict "executable bit conflict")
+end
+
 let irmin local =
-  let module Store = Irmin_mem.KV (Irmin.Contents.String) in
+  let module Store =
+    Irmin_mem.Make (Metadata) (Irmin.Contents.String) (Irmin.Path.String_list)
+      (Irmin.Branch.String)
+      (Irmin.Hash.BLAKE2B)
+  in
   let store =
     let open Lwt.Infix in
     Store.Repo.v (Irmin_mem.config ()) >>= fun repo -> Store.master repo
