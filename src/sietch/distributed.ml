@@ -1,26 +1,9 @@
 open Stdune
 open Cache
+open Utils
 include Distributed_intf
 module Metadata_file = Cache.Local.Metadata_file
 module Log = Dune_util.Log
-
-module type Monad = sig
-  type 'a t
-
-  module Infix : sig
-    val ( >>= ) : 'a t -> ('a -> 'b t) -> 'b t
-
-    val ( >|= ) : 'a t -> ('a -> 'b) -> 'b t
-  end
-end
-
-module Let_syntax (O : Monad) = struct
-  include O.Infix
-
-  let ( let* ) = ( >>= )
-
-  let ( let+ ) = ( >|= )
-end
 
 module Lwt_result = struct
   include Lwt_result

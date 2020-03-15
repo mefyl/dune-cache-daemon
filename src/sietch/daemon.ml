@@ -7,12 +7,21 @@ open Cache.Messages
 open Result.O
 open Pp.O
 
+type error =
+  [ `Local_cache_error of string
+  | `Fatal of string
+  ]
+
+module LwtR = struct
+  let ( let* ) = Lwt_result.Infix.( >>= )
+end
+
 type client =
   { cache : Cache.Local.t
   ; common_metadata : Sexp.t list
-  ; fd : Unix.file_descr
-  ; input : char Stream.t
-  ; output : out_channel
+  ; fd : Lwt_unix.file_descr
+  ; input : Csexp_generic.Lwt_istream.t
+  ; output : Csexp_generic.Lwt_ostream.t
   ; peer : Unix.sockaddr
   ; version : version
   }
@@ -53,14 +62,17 @@ let check_port_file ?(close = true) p =
   | Result.Error e -> Result.Error e
 
 let send_sexp output sexp =
-  output_string output (Csexp.to_string sexp);
-  flush output
+  let open LwtR in
+  let* () = Csexp_generic.Parser_lwt.serialize output sexp in
+  Lwt_io.flush output |> Lwt.map Result.ok
 
 let send version output message =
   send_sexp output (sexp_of_message version message)
 
+type fd = Lwt_unix.file_descr
+
 module ClientsKey = struct
-  type t = Unix.file_descr
+  type t = fd
 
   let compare a b = Ordering.of_int (Stdlib.compare a b)
 
@@ -73,42 +85,46 @@ type config = { exit_no_client : bool }
 
 type event =
   | Stop
-  | New_client of Unix.file_descr * Unix.sockaddr
-  | Client_left of Unix.file_descr
+  | New_client of fd * Unix.sockaddr
+  | Client_left of fd
 
 type t =
   { root : Path.t
-  ; mutable socket : Unix.file_descr option
-  ; mutable clients : (client * Thread.t) Clients.t
+  ; mutable socket : fd option
+  ; mutable clients : (client * unit Lwt.t) Clients.t
   ; mutable endpoint : string option
-  ; mutable accept_thread : Thread.t option
-  ; mutable trim_thread : Thread.t option
+  ; mutable accept_thread : unit Lwt.t option
+  ; mutable trim_thread : unit Lwt.t option
   ; config : config
-  ; events : event Evt.channel
+  ; events : event Lwt_stream.t
+  ; event_push : event option -> unit
   ; cache : Cache.Local.t
   ; distributed : (module Distributed.S)
   }
 
 exception Error of string
 
-let make ?root ~config () : t =
+let make ?root ~config () =
   match
     Cache.Local.make ?root ~duplication_mode:Cache.Duplication_mode.Hardlink
       (fun _ -> ())
   with
-  | Result.Error msg -> User_error.raise [ Pp.text msg ]
+  | Result.Error msg -> Lwt_result.fail (`Local_cache_error msg)
   | Result.Ok cache ->
-    { root = Option.value root ~default:(Cache.Local.default_root ())
-    ; socket = None
-    ; clients = Clients.empty
-    ; endpoint = None
-    ; accept_thread = None
-    ; trim_thread = None
-    ; config
-    ; events = Evt.new_channel ()
-    ; cache
-    ; distributed = Distributed.irmin cache
-    }
+    let events, event_push = Lwt_stream.create () in
+    Lwt_result.return
+      { root = Option.value root ~default:(Cache.Local.default_root ())
+      ; socket = None
+      ; clients = Clients.empty
+      ; endpoint = None
+      ; accept_thread = None
+      ; trim_thread = None
+      ; config
+      ; events
+      ; event_push
+      ; cache
+      ; distributed = Distributed.irmin cache
+      }
 
 let getsockname = function
   | Unix.ADDR_UNIX _ ->
@@ -120,47 +136,74 @@ let peer_name s =
   let addr, port = getsockname s in
   Printf.sprintf "%s:%d" (Unix.string_of_inet_addr addr) port
 
-let stop daemon = Evt.sync (Evt.send daemon.events Stop)
-
 let my_versions : version list = [ { major = 1; minor = 2 } ]
 
 let endpoint m = m.endpoint
 
-let client_handle version output = function
-  | Cache.Dedup f -> send version output (Dedup f)
+let client_handle peer version output = function
+  | Cache.Dedup f ->
+    let send () =
+      let sent = send version output (Dedup f)
+      and f = function
+        | Result.Ok () -> ()
+        | Result.Error (`Write_error e) ->
+          Log.info [ Pp.textf "%s: write error: %s" (peer_name peer) e ]
+      in
+      Lwt.map f sent
+    in
+    (* Because the Cache.Local expect a -> unit handler, we have to run this
+       asynchronously *)
+    (* FIXME: Hence we should probably lock. *)
+    Lwt.async send
+
+let protect ~f ~finally =
+  let open Let_syntax (Lwt) in
+  try
+    let* res = f () in
+    let+ () = finally () in
+    res
+  with e ->
+    let* () = finally () in
+    raise e
+
+let outgoing_message_of_sexp version sexp =
+  outgoing_message_of_sexp version sexp
+  |> Result.map_error ~f:(fun s -> `Protocol_error s)
 
 let client_thread (daemon, (client : client)) =
-  let events = daemon.events in
   try
     let handle_cmd (client : client) sexp =
+      let log_error op = function
+        | Result.Ok () -> ()
+        | Result.Error e ->
+          Log.info [ Pp.textf "%s: %s error: %s" (peer_name client.peer) op e ]
+      in
       let* msg = outgoing_message_of_sexp client.version sexp in
       match msg with
       | Hint keys ->
-        let+ () =
-          let module D = (val daemon.distributed) in
-          let f k = D.prefetch k in
-          Result.List.iter ~f keys
-        in
-        client
+        let module D = (val daemon.distributed) in
+        let f k = D.prefetch k in
+        Result.List.iter ~f keys |> log_error "distribute";
+        Result.Ok client
       | Promote { duplication; repository; files; key; metadata } ->
         let metadata = metadata @ client.common_metadata in
-        let+ metadata, _ =
-          Cache.Local.promote_sync client.cache files key metadata ~repository
-            ~duplication
-        in
-        let () =
+        let res =
+          let+ metadata, _ =
+            Cache.Local.promote_sync client.cache files key metadata ~repository
+              ~duplication
+          in
           (* distribute *)
           let module D = (val daemon.distributed) in
-          match D.distribute key metadata with
-          | Result.Ok () -> ()
-          | Result.Error e -> Log.info [ Pp.textf "failed to distribute: %s" e ]
+          D.distribute key metadata |> log_error "distribute"
         in
-        client
+        log_error "promote" res;
+        Result.Ok client
       | SetBuildRoot root ->
-        let+ cache = Cache.Local.set_build_dir client.cache root in
-        { client with cache }
+        Result.map_error ~f:(fun e -> `Local_cache_error e)
+        @@ let+ cache = Cache.Local.set_build_dir client.cache root in
+           { client with cache }
       | SetCommonMetadata metadata ->
-        Result.ok { client with common_metadata = metadata }
+        Result.Ok { client with common_metadata = metadata }
       | SetRepos repositories ->
         let cache = Cache.Local.with_repositories client.cache repositories in
         Result.Ok { client with cache }
@@ -168,47 +211,46 @@ let client_thread (daemon, (client : client)) =
     let input = client.input in
     let f () =
       let rec handle client =
-        match Stream.peek input with
-        | None -> Log.info [ Pp.textf "%s: ended" (peer_name client.peer) ]
+        let open Lwt_result.Infix in
+        let open Csexp_generic.Lwt_istream in
+        let open LwtR in
+        peek input >>= function
+        | None ->
+          Log.info [ Pp.textf "%s: ended" (peer_name client.peer) ];
+          Lwt_result.return client
         | Some '\n' ->
           (* Skip toplevel newlines, for easy netcat interaction *)
-          Stream.junk input;
+          let* _ = next input in
           (handle [@tailcall]) client
-        | _ -> (
-          match
-            let* cmd =
-              Result.map_error
-                ~f:(fun r -> "parse error: " ^ r)
-                (Csexp.parse input)
-            in
-            Log.info
-              [ Pp.box ~indent:2
-                @@ Pp.textf "%s: received command" (peer_name client.peer)
-                   ++ Pp.space
-                   ++ Pp.hbox (Pp.text @@ Sexp.to_string cmd)
-              ];
-            handle_cmd client cmd
-          with
-          | Result.Error e ->
-            Log.info
-              [ Pp.textf "%s: command error: %s" (peer_name client.peer) e ];
-            handle client
-          | Result.Ok client -> handle client )
+        | _ ->
+          let* cmd = Csexp_generic.Parser_lwt.parse input in
+          Log.info
+            [ Pp.box ~indent:2
+              @@ Pp.textf "%s: received command" (peer_name client.peer)
+                 ++ Pp.space
+                 ++ Pp.hbox (Pp.text @@ Sexp.to_string cmd)
+            ];
+          let* client = handle_cmd client cmd |> Lwt.return in
+          (handle [@tailcall]) client
       in
       handle client
     and finally () =
-      ( try
-          Unix.shutdown client.fd Unix.SHUTDOWN_ALL;
-          Unix.close client.fd
-        with Unix.Unix_error (Unix.ENOTCONN, _, _) -> () );
-      Cache.Local.teardown client.cache;
-      Evt.sync (Evt.send events (Client_left client.fd))
+      let open Let_syntax (Lwt) in
+      let () =
+        try Lwt_unix.shutdown client.fd Unix.SHUTDOWN_ALL
+        with Unix.Unix_error (Unix.ENOTCONN, _, _) -> ()
+      in
+      let+ () = Lwt_unix.close client.fd in
+      let () = Cache.Local.teardown client.cache in
+      daemon.event_push (Some (Client_left client.fd))
     in
-    try Exn.protect ~f ~finally with
+    try protect ~f ~finally with
     | Unix.Unix_error (Unix.EBADF, _, _) ->
-      Log.info [ Pp.textf "%s: ended" (peer_name client.peer) ]
+      Log.info [ Pp.textf "%s: ended" (peer_name client.peer) ];
+      Lwt_result.return client
     | Sys_error msg ->
-      Log.info [ Pp.textf "%s: ended: %s" (peer_name client.peer) msg ]
+      Log.info [ Pp.textf "%s: ended: %s" (peer_name client.peer) msg ];
+      Lwt_result.return client
   with Code_error.E e as exn ->
     Log.info
       [ Pp.textf "%s: fatal error: %s" (peer_name client.peer)
@@ -216,7 +258,8 @@ let client_thread (daemon, (client : client)) =
       ];
     raise exn
 
-let run ?(port_f = ignore) ?(port = 0) daemon =
+let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
+    ?(trim_size = 10 * 1024 * 1024 * 1024) daemon =
   let trim_thread max_size period cache =
     let rec trim () =
       Unix.sleep period;
@@ -239,120 +282,162 @@ let run ?(port_f = ignore) ?(port = 0) daemon =
   in
   let rec accept_thread sock =
     let rec accept () =
-      try Unix.accept sock
+      try Lwt_unix.accept sock
       with Unix.Unix_error (Unix.EINTR, _, _) -> (accept [@tailcall]) ()
     in
-    let fd, peer = accept () in
-    ( try Evt.sync (Evt.send daemon.events (New_client (fd, peer)))
-      with Unix.Unix_error (Unix.EBADF, _, _) -> () );
+    let open Let_syntax (Lwt) in
+    let* fd, peer = accept () in
+    daemon.event_push (Some (New_client (fd, peer)));
     (accept_thread [@tailcall]) sock
   in
-  let f () =
-    let+ trim_period =
-      Option.value
-        ~default:(Result.Ok (10 * 60))
-        (Option.map ~f:int_of_string
-           (Env.get Env.initial "DUNE_CACHE_TRIM_PERIOD"))
-    and+ trim_size =
-      Option.value
-        ~default:(Result.Ok (10 * 1024 * 1024 * 1024))
-        (Option.map ~f:int_of_string
-           (Env.get Env.initial "DUNE_CACHE_TRIM_SIZE"))
-    in
-    let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-    daemon.socket <- Some sock;
-    Unix.bind sock (Unix.ADDR_INET (Unix.inet_addr_of_string "127.0.0.1", port));
-    let addr, port = getsockname (Unix.getsockname sock) in
-    let endpoint =
-      Printf.sprintf "%s:%i" (Unix.string_of_inet_addr addr) port
-    in
-    daemon.endpoint <- Some endpoint;
-    port_f endpoint;
-    Unix.listen sock 1024;
-    daemon.accept_thread <- Some (Thread.create accept_thread sock);
-    daemon.trim_thread <-
-      Some (Thread.create (trim_thread trim_size trim_period) daemon.cache);
-    let rec handle () =
-      let stop () =
-        let () =
-          match daemon.socket with
-          | Some fd ->
-            daemon.socket <- None;
-            let clean f = ignore (Clients.iter ~f daemon.clients) in
-            clean (fun (client, _) -> Unix.shutdown client.fd Unix.SHUTDOWN_ALL);
-            clean (fun (_, tid) -> Thread.join tid);
-            clean (fun (client, _) -> Unix.close client.fd);
-            Unix.close fd
-          | _ -> Log.info [ Pp.textf "stop" ]
-        in
-        Cache.Local.teardown daemon.cache
-      in
-      ( match Evt.sync (Evt.receive daemon.events) with
-      | Stop -> stop ()
-      | New_client (fd, peer) -> (
-        let output = Unix.out_channel_of_descr fd
-        and input = Stream.of_channel (Unix.in_channel_of_descr fd) in
-        match
-          Log.info [ Pp.textf "accept new client %s" (peer_name peer) ];
-          let* version = negotiate_version my_versions fd input output in
-          Log.info
-            [ Pp.textf "negotiated protocol version %s"
-              @@ Cache.Messages.string_of_version version
-            ];
-          let client =
-            let cache =
-              match
-                Cache.Local.make ~root:daemon.root
-                  ~duplication_mode:Cache.Duplication_mode.Hardlink
-                  (client_handle version output)
-              with
-              | Result.Ok m -> m
-              | Result.Error e -> User_error.raise [ Pp.textf "%s" e ]
-            in
-            { cache; common_metadata = []; fd; input; output; peer; version }
-          in
-          let tid = Thread.create client_thread (daemon, client) in
-          let+ clients =
-            Result.map_error
-              ~f:(fun _ -> "duplicate socket")
-              (Clients.add daemon.clients client.fd (client, tid))
-          in
-          daemon.clients <- clients
-        with
-        | Result.Ok () -> ()
-        | Result.Error msg -> Log.info [ Pp.textf "reject client: %s" msg ] )
-      | Client_left fd ->
-        daemon.clients <- Clients.remove daemon.clients fd;
-        if daemon.config.exit_no_client && Clients.is_empty daemon.clients then
-          stop () );
-      if Option.is_some daemon.socket then (handle [@tailcall]) ()
-    in
-    handle ()
+  let sock = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  daemon.socket <- Some sock;
+  let open Let_syntax (Lwt) in
+  let* () =
+    Lwt_unix.bind sock
+      (Unix.ADDR_INET (Unix.inet_addr_of_string "127.0.0.1", port))
   in
-  match f () with
-  | Result.Ok () -> ()
-  | Result.Error msg -> User_error.raise [ Pp.text msg ]
-  | exception Unix.Unix_error (errno, f, _) ->
-    User_error.raise
-      [ Pp.textf "unable to %s: %s\n" f (Unix.error_message errno) ]
+  let addr, port = getsockname (Lwt_unix.getsockname sock) in
+  let endpoint = Printf.sprintf "%s:%i" (Unix.string_of_inet_addr addr) port in
+  daemon.endpoint <- Some endpoint;
+  port_f endpoint;
+  Lwt_unix.listen sock 1024;
+  daemon.accept_thread <- Some (accept_thread sock);
+  daemon.trim_thread <- Some (trim_thread trim_size trim_period daemon.cache);
+  let rec handle () =
+    let stop () =
+      Log.info [ Pp.textf "stop" ];
+      let+ () =
+        match daemon.socket with
+        | Some fd ->
+          daemon.socket <- None;
+          let clean f = Lwt_list.iter_p f (Clients.to_list daemon.clients) in
+          let* () =
+            clean (fun (fd, _) ->
+                Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL |> Lwt.return)
+          in
+          let* () = clean (fun (_, (_, thread)) -> thread) in
+          let* () = clean (fun (fd, _) -> Lwt_unix.close fd) in
+          Lwt_unix.close fd
+        | None -> Lwt.return ()
+      in
+      Cache.Local.teardown daemon.cache
+    in
+    Lwt_stream.get daemon.events >>= function
+    | None
+    | Some Stop ->
+      stop ()
+    | Some (New_client (fd, peer)) ->
+      let input =
+        Lwt_io.of_fd ~mode:Lwt_io.input fd |> Csexp_generic.Lwt_istream.make
+      and output =
+        Lwt_io.of_fd ~mode:Lwt_io.output fd |> Csexp_generic.Lwt_ostream.make
+      in
+      let res =
+        Log.info [ Pp.textf "accept new client %s" (peer_name peer) ];
+        let open LwtR in
+        let* () =
+          let version_message =
+            Lang my_versions
+            |> Cache.Messages.sexp_of_message { major = 1; minor = 0 }
+          in
+          Csexp_generic.Parser_lwt.serialize output version_message
+        in
+        let* their_versions =
+          let* msg = Csexp_generic.Parser_lwt.parse input in
+          initial_message_of_sexp msg
+          |> Result.map ~f:(fun (Lang res) -> res)
+          |> Result.map_error ~f:(fun e -> `Protocol_error e)
+          |> Lwt.return
+        in
+        let* version =
+          highest_common_version my_versions their_versions
+          |> Result.map_error ~f:(fun _ ->
+                 `Version_mismatch (my_versions, their_versions))
+          |> Lwt.return
+        in
+        Log.info
+          [ Pp.textf "negotiated protocol version %s"
+            @@ Cache.Messages.string_of_version version
+          ];
+        let client =
+          let cache =
+            match
+              Cache.Local.make ~root:daemon.root
+                ~duplication_mode:Cache.Duplication_mode.Hardlink
+                (client_handle peer version output)
+            with
+            | Result.Ok m -> m
+            | Result.Error e -> User_error.raise [ Pp.textf "%s" e ]
+          in
+          { cache; common_metadata = []; fd; input; output; peer; version }
+        in
+        let thread =
+          let open Lwt.Infix in
+          client_thread (daemon, client) >|= function
+          | Result.Ok _ -> ()
+          | Result.Error (`Local_cache_error e)
+          | Result.Error (`Parse_error e)
+          | Result.Error (`Protocol_error e)
+          | Result.Error (`Read_error e) ->
+            Log.info [ Pp.textf "%s: client error: %s" (peer_name peer) e ]
+        in
+        match Clients.add daemon.clients client.fd (client, thread) with
+        | Result.Ok clients ->
+          daemon.clients <- clients;
+          Lwt_result.return ()
+        | Result.Error _ -> Code_error.raise "duplicate socket" []
+      and print_error = function
+        | Result.Ok () -> ()
+        | Result.Error e -> (
+          match e with
+          | `Parse_error msg
+          | `Protocol_error msg
+          | `Read_error msg
+          | `Write_error msg ->
+            Log.info [ Pp.textf "reject client: %s" msg ]
+          | `Version_mismatch _ ->
+            Log.info [ Pp.textf "reject client: version mismatch" ] )
+      in
+      Lwt.map print_error res
+    | Some (Client_left fd) ->
+      daemon.clients <- Clients.remove daemon.clients fd;
+      let* () =
+        if daemon.config.exit_no_client && Clients.is_empty daemon.clients then
+          stop ()
+        else
+          Lwt.return ()
+      in
+      if Option.is_some daemon.socket then
+        (handle [@tailcall]) ()
+      else
+        Lwt.return ()
+  in
+  handle ()
 
 let () = Logs.set_reporter (Logs.format_reporter ())
 
 let daemon ~root ~config started =
-  Path.mkdir_p root;
-  let daemon = make ~root ~config () in
-  (* Event blocks signals when waiting. Use a separate thread to catch signals. *)
-  let signal_handler s =
-    Log.info [ Pp.textf "caught signal %i, exiting" s ];
-    ignore (Thread.create stop daemon)
-  and signals = [ Sys.sigint; Sys.sigterm ] in
-  let rec signals_handler () =
-    signal_handler (Thread.wait_signal signals);
-    signals_handler ()
+  let sietch =
+    let open LwtR in
+    Path.mkdir_p root;
+    let* daemon = make ~root ~config () in
+    (* Event blocks signals when waiting. Use a separate thread to catch
+       signals. *)
+    let signal_handler s =
+      Log.info [ Pp.textf "caught signal %i, exiting" s ];
+      daemon.event_push (Some Stop)
+    and signals = [ Sys.sigint; Sys.sigterm ] in
+    let _ =
+      let f s = Lwt_unix.on_signal s signal_handler in
+      List.map ~f signals
+    in
+    let ran = run ~port_f:started daemon in
+    Lwt.map Result.ok ran
   in
-  ignore (Thread.sigmask Unix.SIG_BLOCK signals);
-  ignore (Thread.create signals_handler ());
-  try run ~port_f:started daemon
-  with Error s ->
-    Printf.fprintf stderr "%s: fatal error: %s\n%!" Sys.argv.(0) s;
+  match Lwt_main.run sietch with
+  | Result.Ok () -> ()
+  | Result.Error (`Fatal e)
+  | Result.Error (`Local_cache_error e) ->
+    Printf.fprintf stderr "%s: fatal error: %s\n%!" Sys.argv.(0) e;
     exit 1
