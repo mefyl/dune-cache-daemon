@@ -170,6 +170,14 @@ let outgoing_message_of_sexp version sexp =
   outgoing_message_of_sexp version sexp
   |> Result.map_error ~f:(fun s -> `Protocol_error s)
 
+let close_client_socket fd =
+  let open Let_syntax (Lwt) in
+  let () =
+    try Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL
+    with Unix.Unix_error (Unix.ENOTCONN, _, _) -> ()
+  in
+  Lwt_unix.close fd
+
 let client_thread (daemon, (client : client)) =
   try
     let handle_cmd (client : client) sexp =
@@ -236,11 +244,7 @@ let client_thread (daemon, (client : client)) =
       handle client
     and finally () =
       let open Let_syntax (Lwt) in
-      let () =
-        try Lwt_unix.shutdown client.fd Unix.SHUTDOWN_ALL
-        with Unix.Unix_error (Unix.ENOTCONN, _, _) -> ()
-      in
-      let+ () = Lwt_unix.close client.fd in
+      let+ () = close_client_socket client.fd in
       let () = Cache.Local.teardown client.cache in
       daemon.event_push (Some (Client_left client.fd))
     in
@@ -335,7 +339,7 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
       and output =
         Lwt_io.of_fd ~mode:Lwt_io.output fd |> Csexp_generic.Lwt_ostream.make
       in
-      let res =
+      let* res =
         Log.info [ Pp.textf "accept new client %s" (peer_name peer) ];
         let open LwtR in
         let* () =
@@ -389,19 +393,22 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
           daemon.clients <- clients;
           Lwt_result.return ()
         | Result.Error _ -> Code_error.raise "duplicate socket" []
-      and print_error = function
-        | Result.Ok () -> ()
-        | Result.Error e -> (
-          match e with
+      in
+      let* () =
+        match res with
+        | Result.Ok () -> Lwt.return ()
+        | Result.Error e ->
+          ( match e with
           | `Parse_error msg
           | `Protocol_error msg
           | `Read_error msg
           | `Write_error msg ->
             Log.info [ Pp.textf "reject client: %s" msg ]
           | `Version_mismatch _ ->
-            Log.info [ Pp.textf "reject client: version mismatch" ] )
+            Log.info [ Pp.textf "reject client: version mismatch" ] );
+          close_client_socket fd
       in
-      Lwt.map print_error res
+      (handle [@tailcall]) ()
     | Some (Client_left fd) ->
       daemon.clients <- Clients.remove daemon.clients fd;
       let* () =
@@ -427,7 +434,7 @@ let daemon ~root ~config started =
     (* Event blocks signals when waiting. Use a separate thread to catch
        signals. *)
     let signal_handler s =
-      Log.info [ Pp.textf "caught signal %i, exiting" s ];
+      Log.info [ Pp.textf "caught signal %i, exiting" (-s) ];
       daemon.event_push (Some Stop)
     and signals = [ Sys.sigint; Sys.sigterm ] in
     let _ =
