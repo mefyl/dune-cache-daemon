@@ -193,8 +193,11 @@ let client_thread (daemon, (client : client)) =
         let open Let_syntax (Lwt) in
         let module D = (val daemon.distributed) in
         let f k = D.prefetch k in
-        let* results = Lwt_list.map_s f keys in
-        List.iter ~f:(log_error "distribute") results;
+        let prefetching () =
+          let* results = Lwt_list.map_s f keys in
+          List.iter ~f:(log_error "distribute") results |> Lwt.return
+        in
+        Lwt.async prefetching;
         Lwt_result.return client
       | Promote { duplication; repository; files; key; metadata } ->
         let metadata = metadata @ client.common_metadata in
