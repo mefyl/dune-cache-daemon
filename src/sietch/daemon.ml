@@ -261,8 +261,10 @@ let client_thread (daemon, (client : client)) =
 let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
     ?(trim_size = 10 * 1024 * 1024 * 1024) daemon =
   let trim_thread max_size period cache =
+    let period = float_of_int period in
+    let open Let_syntax (Lwt) in
     let rec trim () =
-      Unix.sleep period;
+      let* () = Lwt_unix.sleep period in
       let () =
         match
           let size = Cache.Local.size cache in
