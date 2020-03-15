@@ -75,7 +75,9 @@ struct
           let idx = int_of_char c - int_of_char '0' in
           if idx < 0 || idx > 9 then
             Result.Error
-              (`Parse_error (Printf.sprintf "invalid character in size: %c" c))
+              (`Parse_error
+                (Printf.sprintf "invalid character in size: %s"
+                   (Char.escaped c)))
             |> IMonad.return
           else
             read_size ((10 * acc) + idx)
