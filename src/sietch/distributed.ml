@@ -126,11 +126,7 @@ let _irmin (type t) cache
       Io.write_file ~binary path_tmp contents;
       Path.chmod ~mode path_tmp;
       Path.mkdir_p @@ Path.parent_exn path;
-      Path.rename path_tmp path;
-      Log.info [ Pp.textf "FLM %s" (Path.to_string path) ];
-      if Path.basename path = "c8cffeb4e7b22f2986fe18cffad646b1.1" then
-        Log.info
-          [ Pp.textf "FUCK MY LIFE OK %s" (Io.read_file ~binary:true path) ]
+      Path.rename path_tmp path
 
     let search_missing_file ~of_path ~of_string path dir key =
       if Path.exists path then (
