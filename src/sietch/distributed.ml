@@ -19,9 +19,9 @@ let disabled =
 
     let v = ()
 
-    let distribute _ _ = Result.Ok ()
+    let distribute _ _ = Lwt_result.return ()
 
-    let prefetch _ = Result.Ok ()
+    let prefetch _ = Lwt_result.return ()
   end : S )
 
 let _irmin (type t) cache
@@ -111,12 +111,9 @@ let _irmin (type t) cache
         in
         Irmin.Info.v ~author ~date message
       in
-      let store =
-        Lwt.map
-          (Result.map_error ~f:(fun _ -> "FIXME irmin write error"))
-          (Store.with_tree ~info v [] insert)
-      in
-      Lwt_main.run store
+      Lwt.map
+        (Result.map_error ~f:(fun _ -> "FIXME irmin write error"))
+        (Store.with_tree ~info v [] insert)
 
     let write_file ~binary path (contents, executable) =
       let path_tmp = Path.relative tmp (Path.basename path)
@@ -157,20 +154,17 @@ let _irmin (type t) cache
 
     let rec prefetch key =
       let open Let_syntax (Lwt_result) in
-      let retrieve =
-        let path = Cache.Local.path_metadata cache key in
-        let* metadata =
-          search_missing_file ~of_path:Metadata_file.parse
-            ~of_string:Metadata_file.of_string path "meta" key
-        in
-        match metadata with
-        | None -> Result.Ok () |> Lwt.return
-        | Some (metadata, contents) ->
-          let* () = prefetch_data metadata in
-          Option.iter ~f:(write_file ~binary:false path) contents;
-          Lwt.return (Result.Ok ())
+      let path = Cache.Local.path_metadata cache key in
+      let* metadata =
+        search_missing_file ~of_path:Metadata_file.parse
+          ~of_string:Metadata_file.of_string path "meta" key
       in
-      Lwt_main.run retrieve
+      match metadata with
+      | None -> Result.Ok () |> Lwt.return
+      | Some (metadata, contents) ->
+        let* () = prefetch_data metadata in
+        Option.iter ~f:(write_file ~binary:false path) contents;
+        Lwt.return (Result.Ok ())
 
     and prefetch_data (metadata : Metadata_file.t) =
       let open Let_syntax (Lwt_result) in

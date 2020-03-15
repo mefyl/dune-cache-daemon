@@ -186,35 +186,43 @@ let client_thread (daemon, (client : client)) =
         | Result.Error e ->
           Log.info [ Pp.textf "%s: %s error: %s" (peer_name client.peer) op e ]
       in
-      let* msg = outgoing_message_of_sexp client.version sexp in
+      let open LwtR in
+      let* msg = outgoing_message_of_sexp client.version sexp |> Lwt.return in
       match msg with
       | Hint keys ->
+        let open Let_syntax (Lwt) in
         let module D = (val daemon.distributed) in
         let f k = D.prefetch k in
-        Result.List.iter ~f keys |> log_error "distribute";
-        Result.Ok client
+        let* results = Lwt_list.map_s f keys in
+        List.iter ~f:(log_error "distribute") results;
+        Lwt_result.return client
       | Promote { duplication; repository; files; key; metadata } ->
         let metadata = metadata @ client.common_metadata in
-        let res =
-          let+ metadata, _ =
+        let* () =
+          let* metadata, _ =
             Cache.Local.promote_sync client.cache files key metadata ~repository
               ~duplication
+            |> Result.map_error ~f:(fun e -> `Distribution_error e)
+            |> Lwt.return
           in
           (* distribute *)
           let module D = (val daemon.distributed) in
-          D.distribute key metadata |> log_error "distribute"
+          let%lwt res = D.distribute key metadata in
+          res |> log_error "distribute" |> Lwt_result.return
         in
-        log_error "promote" res;
-        Result.Ok client
+        Lwt_result.return client
       | SetBuildRoot root ->
-        Result.map_error ~f:(fun e -> `Local_cache_error e)
-        @@ let+ cache = Cache.Local.set_build_dir client.cache root in
-           { client with cache }
+        let res =
+          let open Result.O in
+          let+ cache = Cache.Local.set_build_dir client.cache root in
+          { client with cache }
+        in
+        res |> Result.map_error ~f:(fun e -> `Local_cache_error e) |> Lwt.return
       | SetCommonMetadata metadata ->
-        Result.Ok { client with common_metadata = metadata }
+        Lwt_result.return { client with common_metadata = metadata }
       | SetRepos repositories ->
         let cache = Cache.Local.with_repositories client.cache repositories in
-        Result.Ok { client with cache }
+        Lwt_result.return { client with cache }
     in
     let input = client.input in
     let f () =
@@ -238,7 +246,7 @@ let client_thread (daemon, (client : client)) =
                  ++ Pp.space
                  ++ Pp.hbox (Pp.text @@ Sexp.to_string cmd)
             ];
-          let* client = handle_cmd client cmd |> Lwt.return in
+          let* client = handle_cmd client cmd in
           (handle [@tailcall]) client
       in
       handle client
@@ -382,6 +390,7 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
           let open Lwt.Infix in
           client_thread (daemon, client) >|= function
           | Result.Ok _ -> ()
+          | Result.Error (`Distribution_error e)
           | Result.Error (`Local_cache_error e)
           | Result.Error (`Parse_error e)
           | Result.Error (`Protocol_error e)

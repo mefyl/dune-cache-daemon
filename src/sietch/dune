@@ -5,4 +5,5 @@
  (libraries dune-private-libs.cache dune-private-libs.stdune irmin irmin-mem
    lwt lwt.unix)
  (synopsis "Dune distributed binary artifacts cache")
- (preprocess future_syntax))
+ (preprocess
+  (pps lwt_ppx)))
