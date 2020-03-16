@@ -64,7 +64,10 @@ let check_port_file ?(close = true) p =
 let send_sexp output sexp =
   let open LwtR in
   let* () = Csexp_generic.Parser_lwt.serialize output sexp in
-  Lwt_io.flush output |> Lwt.map Result.ok
+  try%lwt Lwt_io.flush output |> Lwt.map Result.ok
+  with Unix.Unix_error (e, f, _) ->
+    Lwt_result.fail
+      (`Write_error (Printf.sprintf "%s: %s" (Unix.error_message e) f))
 
 let send version output message =
   send_sexp output (sexp_of_message version message)

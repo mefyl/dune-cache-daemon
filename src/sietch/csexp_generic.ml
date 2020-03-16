@@ -166,18 +166,15 @@ module Lwt_istream = struct
   end
 
   let lwt_read stream =
-    let read () =
+    try%lwt
       let open Let_syntax (Lwt) in
       let+ c = Lwt_io.read_char stream.channel in
       Result.Ok (Some c)
-    and catch = function
-      | End_of_file -> Lwt_result.return None
-      | Unix.Unix_error (e, f, _) ->
-        Error (`Read_error (Printf.sprintf "%s: %s" (Unix.error_message e) f))
-        |> Lwt.return
-      | exn -> raise exn
-    in
-    Lwt.catch read catch
+    with
+    | End_of_file -> Lwt_result.return None
+    | Unix.Unix_error (e, f, _) ->
+      Error (`Read_error (Printf.sprintf "%s: %s" (Unix.error_message e) f))
+      |> Lwt.return
 
   let peek stream =
     match stream.peek with
@@ -214,14 +211,10 @@ module Lwt_ostream = struct
   let make channel = channel
 
   let send stream str =
-    let send () = Lwt_io.write stream str |> Lwt.map Result.ok
-    and catch = function
-      | Unix.Unix_error (e, f, _) ->
-        Error (`Write_error (Printf.sprintf "%s: %s" (Unix.error_message e) f))
-        |> Lwt.return
-      | exn -> raise exn
-    in
-    Lwt.catch send catch
+    try%lwt Lwt_io.write stream str |> Lwt.map Result.ok
+    with Unix.Unix_error (e, f, _) ->
+      Lwt_result.fail
+        (`Write_error (Printf.sprintf "%s: %s" (Unix.error_message e) f))
 end
 
 module Lwt_stacked =
