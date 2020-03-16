@@ -1,6 +1,7 @@
 module Evt = Event
 module Utils = Utils
 module Log = Dune_util.Log
+module Csexp_sietch = Csexp
 open Stdune
 open Utils
 open Cache.Messages
@@ -20,8 +21,8 @@ type client =
   { cache : Cache.Local.t
   ; common_metadata : Sexp.t list
   ; fd : Lwt_unix.file_descr
-  ; input : Csexp_generic.Lwt_istream.t
-  ; output : Csexp_generic.Lwt_ostream.t
+  ; input : Csexp_sietch.Generic.Lwt_istream.t
+  ; output : Csexp_sietch.Generic.Lwt_ostream.t
   ; peer : Unix.sockaddr
   ; version : version
   }
@@ -63,7 +64,7 @@ let check_port_file ?(close = true) p =
 
 let send_sexp output sexp =
   let open LwtR in
-  let* () = Csexp_generic.Parser_lwt.serialize output sexp in
+  let* () = Csexp_sietch.Generic.Parser_lwt.serialize output sexp in
   try%lwt Lwt_io.flush output |> Lwt.map Result.ok
   with Unix.Unix_error (e, f, _) ->
     Lwt_result.fail
@@ -160,7 +161,7 @@ let client_handle peer version output = function
     Lwt.async send
 
 let protect ~f ~finally =
-  let open Let_syntax (Lwt) in
+  let open LwtO in
   try
     let* res = f () in
     let+ () = finally () in
@@ -174,7 +175,6 @@ let outgoing_message_of_sexp version sexp =
   |> Result.map_error ~f:(fun s -> `Protocol_error s)
 
 let close_client_socket fd =
-  let open Let_syntax (Lwt) in
   let () =
     try Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL
     with Unix.Unix_error (Unix.ENOTCONN, _, _) -> ()
@@ -193,7 +193,7 @@ let client_thread (daemon, (client : client)) =
       let* msg = outgoing_message_of_sexp client.version sexp |> Lwt.return in
       match msg with
       | Hint keys ->
-        let open Let_syntax (Lwt) in
+        let open LwtO in
         let module D = (val daemon.distributed) in
         let f k = D.prefetch k in
         let prefetching () =
@@ -234,7 +234,7 @@ let client_thread (daemon, (client : client)) =
     let f () =
       let rec handle client =
         let open Lwt_result.Infix in
-        let open Csexp_generic.Lwt_istream in
+        let open Csexp_sietch.Generic.Lwt_istream in
         let open LwtR in
         peek input >>= function
         | None ->
@@ -245,7 +245,7 @@ let client_thread (daemon, (client : client)) =
           let* _ = next input in
           (handle [@tailcall]) client
         | _ ->
-          let* cmd = Csexp_generic.Parser_lwt.parse input in
+          let* cmd = Csexp_sietch.Generic.Parser_lwt.parse input in
           Log.info
             [ Pp.box ~indent:2
               @@ Pp.textf "%s: received command" (peer_name client.peer)
@@ -257,7 +257,7 @@ let client_thread (daemon, (client : client)) =
       in
       handle client
     and finally () =
-      let open Let_syntax (Lwt) in
+      let open LwtO in
       let+ () = close_client_socket client.fd in
       let () = Cache.Local.teardown client.cache in
       daemon.event_push (Some (Client_left client.fd))
@@ -280,7 +280,7 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
     ?(trim_size = 10 * 1024 * 1024 * 1024) daemon =
   let trim_thread max_size period cache =
     let period = float_of_int period in
-    let open Let_syntax (Lwt) in
+    let open LwtO in
     let rec trim () =
       let* () = Lwt_unix.sleep period in
       let () =
@@ -305,14 +305,14 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
       try Lwt_unix.accept sock
       with Unix.Unix_error (Unix.EINTR, _, _) -> (accept [@tailcall]) ()
     in
-    let open Let_syntax (Lwt) in
+    let open LwtO in
     let* fd, peer = accept () in
     daemon.event_push (Some (New_client (fd, peer)));
     (accept_thread [@tailcall]) sock
   in
   let sock = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   daemon.socket <- Some sock;
-  let open Let_syntax (Lwt) in
+  let open LwtO in
   let* () =
     Lwt_unix.bind sock
       (Unix.ADDR_INET (Unix.inet_addr_of_string "127.0.0.1", port))
@@ -349,9 +349,11 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
       stop ()
     | Some (New_client (fd, peer)) ->
       let input =
-        Lwt_io.of_fd ~mode:Lwt_io.input fd |> Csexp_generic.Lwt_istream.make
+        Lwt_io.of_fd ~mode:Lwt_io.input fd
+        |> Csexp_sietch.Generic.Lwt_istream.make
       and output =
-        Lwt_io.of_fd ~mode:Lwt_io.output fd |> Csexp_generic.Lwt_ostream.make
+        Lwt_io.of_fd ~mode:Lwt_io.output fd
+        |> Csexp_sietch.Generic.Lwt_ostream.make
       in
       let* res =
         Log.info [ Pp.textf "accept new client %s" (peer_name peer) ];
@@ -361,10 +363,10 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
             Lang my_versions
             |> Cache.Messages.sexp_of_message { major = 1; minor = 0 }
           in
-          Csexp_generic.Parser_lwt.serialize output version_message
+          Csexp_sietch.Generic.Parser_lwt.serialize output version_message
         in
         let* their_versions =
-          let* msg = Csexp_generic.Parser_lwt.parse input in
+          let* msg = Csexp_sietch.Generic.Parser_lwt.parse input in
           initial_message_of_sexp msg
           |> Result.map ~f:(fun (Lang res) -> res)
           |> Result.map_error ~f:(fun e -> `Protocol_error e)

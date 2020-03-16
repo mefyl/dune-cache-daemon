@@ -9,14 +9,6 @@ let ( let* ) = Lwt.Infix.( >>= )
 
 let ( and* ) = Lwt.both
 
-module Lwt_result = struct
-  include Lwt_result
-
-  type error = string
-
-  type nonrec 'a t = ('a, error) t
-end
-
 let disabled =
   ( module struct
     type t = unit
@@ -49,7 +41,7 @@ let _irmin (type t) cache
       |> Lwt.map (Option.value ~default:Store.Tree.empty)
 
     let distribute key (metadata : Metadata_file.t) =
-      let open Let_syntax (Lwt) in
+      let open LwtO in
       let insert (root : Store.tree option) =
         let root =
           match root with
@@ -160,7 +152,7 @@ let _irmin (type t) cache
         let f d = Some (d, None) in
         of_path path |> Result.map ~f |> Lwt.return
       ) else
-        let open Let_syntax (Lwt) in
+        let open LwtO in
         Store.find_all v [ dir; Digest.to_string key ] >|= function
         | None ->
           Log.info
@@ -174,7 +166,7 @@ let _irmin (type t) cache
           of_string contents |> Result.map ~f
 
     let rec prefetch key =
-      let open Let_syntax (Lwt_result) in
+      let open LwtrO in
       let path = Cache.Local.path_metadata cache key in
       let* metadata =
         search_missing_file "metadata" ~of_path:Metadata_file.parse
@@ -192,7 +184,7 @@ let _irmin (type t) cache
         Lwt.return (Result.Ok ())
 
     and prefetch_data (metadata : Metadata_file.t) =
-      let open Let_syntax (Lwt_result) in
+      let open LwtrO in
       let retrieve_file (f : File.t) =
         let path = Cache.Local.path_data cache f.digest in
         let path = Path.of_string (Path.to_string path ^ ".1") in
@@ -216,7 +208,7 @@ let _irmin (type t) cache
               ]
         | _ -> Lwt_result.return ()
       in
-      let open Let_syntax (Lwt) in
+      let open LwtO in
       let+ results = Lwt_list.map_p retrieve_file metadata.files in
       Result.List.iter ~f:(fun r -> r) results
   end : S )
