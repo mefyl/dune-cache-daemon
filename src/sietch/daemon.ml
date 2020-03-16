@@ -7,6 +7,7 @@ open Utils
 open Cache.Messages
 open Result.O
 open Pp.O
+module CSexp = Csexp_sietch.Lwt
 
 type error =
   [ `Local_cache_error of string
@@ -21,8 +22,8 @@ type client =
   { cache : Cache.Local.t
   ; common_metadata : Sexp.t list
   ; fd : Lwt_unix.file_descr
-  ; input : Csexp_sietch.Generic.Lwt_istream.t
-  ; output : Csexp_sietch.Generic.Lwt_ostream.t
+  ; input : CSexp.IStream.t
+  ; output : CSexp.OStream.t
   ; peer : Unix.sockaddr
   ; version : version
   }
@@ -64,8 +65,8 @@ let check_port_file ?(close = true) p =
 
 let send_sexp output sexp =
   let open LwtR in
-  let* () = Csexp_sietch.Generic.Parser_lwt.serialize output sexp in
-  try%lwt Lwt_io.flush output |> Lwt.map Result.ok
+  let* () = CSexp.serialize output sexp in
+  try%lwt Lwt_io.flush (CSexp.OStream.to_channel output) |> Lwt.map Result.ok
   with Unix.Unix_error (e, f, _) ->
     Lwt_result.fail
       (`Write_error (Printf.sprintf "%s: %s" (Unix.error_message e) f))
@@ -234,7 +235,7 @@ let client_thread (daemon, (client : client)) =
     let f () =
       let rec handle client =
         let open Lwt_result.Infix in
-        let open Csexp_sietch.Generic.Lwt_istream in
+        let open CSexp.IStream in
         let open LwtR in
         peek input >>= function
         | None ->
@@ -245,7 +246,7 @@ let client_thread (daemon, (client : client)) =
           let* _ = next input in
           (handle [@tailcall]) client
         | _ ->
-          let* cmd = Csexp_sietch.Generic.Parser_lwt.parse input in
+          let* cmd = CSexp.parse input in
           Log.info
             [ Pp.box ~indent:2
               @@ Pp.textf "%s: received command" (peer_name client.peer)
@@ -348,13 +349,8 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
     | Some Stop ->
       stop ()
     | Some (New_client (fd, peer)) ->
-      let input =
-        Lwt_io.of_fd ~mode:Lwt_io.input fd
-        |> Csexp_sietch.Generic.Lwt_istream.make
-      and output =
-        Lwt_io.of_fd ~mode:Lwt_io.output fd
-        |> Csexp_sietch.Generic.Lwt_ostream.make
-      in
+      let input = Lwt_io.of_fd ~mode:Lwt_io.input fd |> CSexp.IStream.make
+      and output = Lwt_io.of_fd ~mode:Lwt_io.output fd |> CSexp.OStream.make in
       let* res =
         Log.info [ Pp.textf "accept new client %s" (peer_name peer) ];
         let open LwtR in
@@ -363,10 +359,10 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
             Lang my_versions
             |> Cache.Messages.sexp_of_message { major = 1; minor = 0 }
           in
-          Csexp_sietch.Generic.Parser_lwt.serialize output version_message
+          CSexp.serialize output version_message
         in
         let* their_versions =
-          let* msg = Csexp_sietch.Generic.Parser_lwt.parse input in
+          let* msg = CSexp.parse input in
           initial_message_of_sexp msg
           |> Result.map ~f:(fun (Lang res) -> res)
           |> Result.map_error ~f:(fun e -> `Protocol_error e)
