@@ -5,6 +5,10 @@ include Distributed_intf
 module Metadata_file = Cache.Local.Metadata_file
 module Log = Dune_util.Log
 
+let ( let* ) = Lwt.Infix.( >>= )
+
+let ( and* ) = Lwt.both
+
 module Lwt_result = struct
   include Lwt_result
 
@@ -115,23 +119,44 @@ let _irmin (type t) cache
         (Result.map_error ~f:(fun _ -> "FIXME irmin write error"))
         (Store.with_tree ~info v [] insert)
 
-    let write_file ~binary path (contents, executable) =
-      let path_tmp = Path.relative tmp (Path.basename path)
-      and mode =
-        if executable then
-          0o500
-        else
-          0o400
-      in
-      Io.write_file ~binary path_tmp contents;
-      Path.chmod ~mode path_tmp;
-      Path.mkdir_p @@ Path.parent_exn path;
-      Path.rename path_tmp path
+    let mkdir p =
+      try%lwt Lwt_unix.mkdir p 0o700
+      with Unix.Unix_error (Unix.EEXIST, _, _) -> Lwt.return ()
 
-    let search_missing_file ~of_path ~of_string path dir key =
+    let write_file path (contents, executable) =
+      try%lwt
+        Lwt.map Result.ok
+        @@
+        let dir = path |> Path.parent_exn |> Path.to_string
+        and path_tmp =
+          path |> Path.basename |> Path.relative tmp |> Path.to_string
+        and path = path |> Path.to_string
+        and perm =
+          if executable then
+            0o500
+          else
+            0o400
+        in
+        let* () =
+          let* output = Lwt_io.open_file ~perm ~mode:Lwt_io.output path_tmp in
+          let* () = Lwt_io.write output contents in
+          Lwt_io.close output
+        and* () = mkdir dir in
+        Lwt_unix.rename path_tmp path
+      with
+      | Unix.Unix_error (Unix.EACCES, _, _) ->
+        (* If the file exists with no write permissions, it is being pulled as
+           part of another hinting. *)
+        Lwt_result.return ()
+      | Unix.Unix_error (e, f, _) ->
+        Lwt_result.fail (Printf.sprintf "%s: %s" (Unix.error_message e) f)
+
+    let search_missing_file t ~of_path ~of_string path dir key =
       if Path.exists path then (
         Log.info
-          [ Pp.textf "file already present locally: %s" (Digest.to_string key) ];
+          [ Pp.textf "%s file already present locally: %s" t
+              (Digest.to_string key)
+          ];
         let f d = Some (d, None) in
         of_path path |> Result.map ~f |> Lwt.return
       ) else
@@ -139,12 +164,12 @@ let _irmin (type t) cache
         Store.find_all v [ dir; Digest.to_string key ] >|= function
         | None ->
           Log.info
-            [ Pp.textf "file not found in the distributed cache: %s"
+            [ Pp.textf "%s file not found in the distributed cache: %s" t
                 (Digest.to_string key)
             ];
           Result.Ok None
         | Some (contents, metadata) ->
-          Log.info [ Pp.textf "retrieved file %s" (Digest.to_string key) ];
+          Log.info [ Pp.textf "retrieved %s file %s" t (Digest.to_string key) ];
           let f d = Some (d, Some (contents, metadata)) in
           of_string contents |> Result.map ~f
 
@@ -152,14 +177,18 @@ let _irmin (type t) cache
       let open Let_syntax (Lwt_result) in
       let path = Cache.Local.path_metadata cache key in
       let* metadata =
-        search_missing_file ~of_path:Metadata_file.parse
+        search_missing_file "metadata" ~of_path:Metadata_file.parse
           ~of_string:Metadata_file.of_string path "meta" key
       in
       match metadata with
       | None -> Result.Ok () |> Lwt.return
       | Some (metadata, contents) ->
         let* () = prefetch_data metadata in
-        Option.iter ~f:(write_file ~binary:false path) contents;
+        let* () =
+          contents
+          |> Option.map ~f:(write_file path)
+          |> Option.value ~default:(Lwt_result.return ())
+        in
         Lwt.return (Result.Ok ())
 
     and prefetch_data (metadata : Metadata_file.t) =
@@ -175,7 +204,7 @@ let _irmin (type t) cache
         in
         match contents with
         | Some ((), Some contents) ->
-          write_file ~binary:true path contents;
+          let+ () = write_file path contents in
           let checksum = Stdune.Digest.file_with_stats path (Path.stat path) in
           if checksum <> f.digest then
             Stdune.User_warning.emit
@@ -185,11 +214,11 @@ let _irmin (type t) cache
                   (Digest.to_string checksum)
                   (Digest.to_string f.digest)
               ]
-        | _ -> ()
+        | _ -> Lwt_result.return ()
       in
       let open Let_syntax (Lwt) in
       let+ results = Lwt_list.map_p retrieve_file metadata.files in
-      Result.List.all results |> Result.map ~f:ignore
+      Result.List.iter ~f:(fun r -> r) results
   end : S )
 
 module Metadata = struct
