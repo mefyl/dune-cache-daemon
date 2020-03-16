@@ -166,13 +166,13 @@ let _irmin (type t) cache
       let open Let_syntax (Lwt_result) in
       let retrieve_file (f : File.t) =
         let path = Cache.Local.path_data cache f.digest in
-        let+ contents =
-          search_missing_file
+        let path = Path.of_string (Path.to_string path ^ ".1") in
+        let* contents =
+          search_missing_file "data"
             ~of_path:(fun _ -> Result.Ok ())
             ~of_string:(fun _ -> Result.Ok ())
             path "files" f.digest
         in
-        let path = Path.of_string (Path.to_string path ^ ".1") in
         match contents with
         | Some ((), Some contents) ->
           write_file ~binary:true path contents;
