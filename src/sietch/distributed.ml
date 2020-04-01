@@ -18,6 +18,10 @@ let disabled =
     let distribute _ _ = Lwt_result.return ()
 
     let prefetch _ = Lwt_result.return ()
+
+    let index_add _ _ _ = Lwt_result.return ()
+
+    let index_prefetch _ _ = Lwt_result.return ()
   end : S )
 
 let _irmin (type t) cache
@@ -29,6 +33,9 @@ let _irmin (type t) cache
        and type metadata = bool) (store : t Lwt.t) =
   ( module struct
     include Store
+
+    let convert_irmin_error =
+      Lwt.map (Result.map_error ~f:(fun _ -> "FIXME irmin write error"))
 
     let compare_trees l r = Store.Tree.hash l = Store.Tree.hash r
 
@@ -100,16 +107,14 @@ let _irmin (type t) cache
         else
           Lwt.return (Some root)
       and info () =
-        let author = "dune-cache <https://github.com/ocaml/dune>"
+        let author = "sietch <https://github.com/ocaml/dune>"
         and date = Int64.of_float (Unix.gettimeofday ())
         and message =
           Format.asprintf "Promotion of rule %s" (Digest.to_string key)
         in
         Irmin.Info.v ~author ~date message
       in
-      Lwt.map
-        (Result.map_error ~f:(fun _ -> "FIXME irmin write error"))
-        (Store.with_tree ~info v [] insert)
+      Store.with_tree ~info v [] insert |> convert_irmin_error
 
     let mkdir p =
       try%lwt Lwt_unix.mkdir p 0o700
@@ -211,6 +216,60 @@ let _irmin (type t) cache
       let open LwtO in
       let+ results = Lwt_list.map_p retrieve_file metadata.files in
       Result.List.iter ~f:(fun r -> r) results
+
+    let index_add name key keys =
+      let open LwtO in
+      let add root =
+        let root =
+          match root with
+          | None -> Store.Tree.empty
+          | Some tree -> tree
+        in
+        let* index = find_or_create_tree root [ "indexes"; name ] in
+        let contents =
+          Csexp.to_string
+            (Sexp.List
+               (List.map ~f:(fun key -> Sexp.Atom (Digest.to_string key)) keys))
+        in
+        let+ tree =
+          Store.Tree.add index ~metadata:false [ Digest.to_string key ] contents
+        in
+        Some tree
+      and info () =
+        let author = "sietch <https://github.com/ocaml/dune>"
+        and date = Int64.of_float (Unix.gettimeofday ())
+        and message = Format.asprintf "Indexing of %s" (Digest.to_string key) in
+        Irmin.Info.v ~author ~date message
+      in
+      Store.with_tree ~info v [] add |> convert_irmin_error
+
+    let index_prefetch name key =
+      let open LwtO in
+      Store.find_all v [ "indexes"; name; Digest.to_string key ] >>= function
+      | None ->
+        Log.info
+          [ Pp.textf "%s not found index %s" (Digest.to_string key) name ];
+        Lwt_result.return ()
+      | Some (contents, _) -> (
+        Log.info
+          [ Pp.textf "retrieved %s from index %s" (Digest.to_string key) name ];
+        match Csexp.parse_string contents with
+        | Result.Ok (Sexp.List keys) ->
+          let f = function
+            | Sexp.Atom key -> (
+              match Digest.from_hex key with
+              | Some key -> prefetch key
+              | None ->
+                Lwt_result.fail
+                  (Format.sprintf "invalid key in index file: %s" key) )
+            | sexp ->
+              Lwt_result.fail
+                (Format.sprintf "invalid key in index file: %s"
+                   (Sexp.to_string sexp))
+          in
+          Lwt_list.map_p f keys
+          |> Lwt.map (fun l -> Result.List.all l |> Result.map ~f:ignore)
+        | _ -> Lwt_result.fail "invalid index file" )
   end : S )
 
 module Metadata = struct
