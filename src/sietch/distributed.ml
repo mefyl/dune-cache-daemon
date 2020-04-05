@@ -84,7 +84,15 @@ let _irmin (type t) cache
                   checksum basename
               ];
           let* contents =
-            let read () = Io.read_file in_the_cache |> Lwt.return in
+            let read () =
+              let* file =
+                Lwt_io.open_file ~mode:Lwt_io.input
+                  (Path.to_string in_the_cache)
+              in
+              let* contents = Lwt_io.read file in
+              let+ () = Lwt_io.close file in
+              contents
+            in
             Lwt_pool.use v.fd_pool read
           in
           let metadata = stats.st_perm land 0o100 != 0 in
