@@ -16,8 +16,6 @@ type error =
 
 module LwtR = struct
   let ( let* ) = Lwt_result.Infix.( >>= )
-
-  let ( let+ ) = Lwt_result.Infix.( >|= )
 end
 
 type client =
@@ -235,16 +233,18 @@ let client_thread daemon client =
             |> Result.map_error ~f:(fun e -> `Distribution_error e)
             |> Lwt.return
           in
-          let+ () =
-            (* distribute *)
-            let module D = (val daemon.distributed) in
-            let%lwt res = D.distribute key metadata in
-            res |> log_error "distribute" |> Lwt_result.return
+          let () =
+            let distribute () =
+              let module D = (val daemon.distributed) in
+              let%lwt res = D.distribute key metadata in
+              res |> log_error "distribute" |> Lwt.return
+            in
+            Lwt.async distribute
           in
           let register_commit repository =
             client.commits.(repository) <- key :: client.commits.(repository)
           in
-          Option.iter ~f:register_commit repository
+          Option.iter ~f:register_commit repository |> Lwt_result.return
         in
         Lwt_result.return client
       | SetBuildRoot root ->

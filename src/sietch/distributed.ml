@@ -41,11 +41,13 @@ let _irmin (type t) cache
 
     type nonrec t =
       { fd_pool : unit Lwt_pool.t
+      ; insert_mutex : Lwt_mutex.t
       ; store : t
       }
 
     let v =
       { fd_pool = Lwt_pool.create 128 (fun () -> Lwt.return ())
+      ; insert_mutex = Lwt_mutex.create ()
       ; store = Lwt_main.run store
       }
 
@@ -125,7 +127,10 @@ let _irmin (type t) cache
         in
         Irmin.Info.v ~author ~date message
       in
-      Store.with_tree ~info v.store [] insert |> convert_irmin_error
+      let distribute () =
+        Store.with_tree ~info v.store [] insert |> convert_irmin_error
+      in
+      Lwt_mutex.with_lock v.insert_mutex distribute
 
     let mkdir p =
       try%lwt Lwt_unix.mkdir p 0o700
