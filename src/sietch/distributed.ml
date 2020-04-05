@@ -241,6 +241,10 @@ let _irmin (type t) cache
         and message = Format.asprintf "Indexing of %s" (Digest.to_string key) in
         Irmin.Info.v ~author ~date message
       in
+      Log.info
+        [ Pp.textf "add %s index for %s: %d entries" name (Digest.to_string key)
+            (List.length keys)
+        ];
       Store.with_tree ~info v [] add |> convert_irmin_error
 
     let index_prefetch name key =

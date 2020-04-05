@@ -16,15 +16,19 @@ type error =
 
 module LwtR = struct
   let ( let* ) = Lwt_result.Infix.( >>= )
+
+  let ( let+ ) = Lwt_result.Infix.( >|= )
 end
 
 type client =
   { cache : Cache.Local.t
+  ; commits : Digest.t list array
   ; common_metadata : Sexp.t list
   ; fd : Lwt_unix.file_descr
   ; input : CSexp.IStream.t
   ; output : CSexp.OStream.t
   ; peer : Unix.sockaddr
+  ; repositories : Cache.repository list
   ; version : version
   }
 
@@ -182,7 +186,26 @@ let close_client_socket fd =
   in
   Lwt_unix.close fd
 
-let client_thread (daemon, (client : client)) =
+let commits_index_key = "commits"
+
+let index_commits { distributed = (module Distributed); _ }
+    ({ commits; repositories; _ } as client) =
+  let open LwtrO in
+  let f i (repository : Cache.repository) =
+    let commits = commits.(i)
+    and key = Digest.string repository.commit in
+    Distributed.index_add commits_index_key key commits
+  in
+  let%lwt results = Lwt_list.mapi_p f repositories in
+  let+ () =
+    Result.List.all results
+    |> Result.map ~f:(fun (_ : unit list) -> ())
+    |> Result.map_error ~f:(fun e -> `Distribution_error e)
+    |> Lwt.return
+  in
+  { client with commits = [||]; repositories = [] }
+
+let client_thread daemon client =
   try
     let handle_cmd (client : client) sexp =
       let log_error op = function
@@ -212,10 +235,16 @@ let client_thread (daemon, (client : client)) =
             |> Result.map_error ~f:(fun e -> `Distribution_error e)
             |> Lwt.return
           in
-          (* distribute *)
-          let module D = (val daemon.distributed) in
-          let%lwt res = D.distribute key metadata in
-          res |> log_error "distribute" |> Lwt_result.return
+          let+ () =
+            (* distribute *)
+            let module D = (val daemon.distributed) in
+            let%lwt res = D.distribute key metadata in
+            res |> log_error "distribute" |> Lwt_result.return
+          in
+          let register_commit repository =
+            client.commits.(repository) <- key :: client.commits.(repository)
+          in
+          Option.iter ~f:register_commit repository
         in
         Lwt_result.return client
       | SetBuildRoot root ->
@@ -228,8 +257,10 @@ let client_thread (daemon, (client : client)) =
       | SetCommonMetadata metadata ->
         Lwt_result.return { client with common_metadata = metadata }
       | SetRepos repositories ->
-        let cache = Cache.Local.with_repositories client.cache repositories in
-        Lwt_result.return { client with cache }
+        let* client = index_commits daemon client in
+        let cache = Cache.Local.with_repositories client.cache repositories
+        and commits = Array.make (List.length repositories) [] in
+        Lwt_result.return { client with cache; commits; repositories }
     in
     let input = client.input in
     let f () =
@@ -239,7 +270,8 @@ let client_thread (daemon, (client : client)) =
         let open LwtR in
         peek input >>= function
         | None ->
-          Log.info [ Pp.textf "%s: ended" (peer_name client.peer) ];
+          Log.info [ Pp.textf "%s: ended -" (peer_name client.peer) ];
+          let* client = index_commits daemon client in
           Lwt_result.return client
         | Some '\n' ->
           (* Skip toplevel newlines, for easy netcat interaction *)
@@ -265,7 +297,7 @@ let client_thread (daemon, (client : client)) =
     in
     try protect ~f ~finally with
     | Unix.Unix_error (Unix.EBADF, _, _) ->
-      Log.info [ Pp.textf "%s: ended" (peer_name client.peer) ];
+      Log.info [ Pp.textf "%s: ended -" (peer_name client.peer) ];
       Lwt_result.return client
     | Sys_error msg ->
       Log.info [ Pp.textf "%s: ended: %s" (peer_name client.peer) msg ];
@@ -388,11 +420,20 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
             | Result.Ok m -> m
             | Result.Error e -> User_error.raise [ Pp.textf "%s" e ]
           in
-          { cache; common_metadata = []; fd; input; output; peer; version }
+          { cache
+          ; commits = [||]
+          ; common_metadata = []
+          ; fd
+          ; input
+          ; output
+          ; peer
+          ; repositories = []
+          ; version
+          }
         in
         let thread =
           let open Lwt.Infix in
-          client_thread (daemon, client) >|= function
+          client_thread daemon client >|= function
           | Result.Ok _ -> ()
           | Result.Error (`Distribution_error e)
           | Result.Error (`Local_cache_error e)
