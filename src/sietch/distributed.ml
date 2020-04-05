@@ -39,7 +39,15 @@ let _irmin (type t) cache
 
     let compare_trees l r = Store.Tree.hash l = Store.Tree.hash r
 
-    let v = Lwt_main.run store
+    type nonrec t =
+      { fd_pool : unit Lwt_pool.t
+      ; store : t
+      }
+
+    let v =
+      { fd_pool = Lwt_pool.create 128 (fun () -> Lwt.return ())
+      ; store = Lwt_main.run store
+      }
 
     let tmp = Cache.Local.path_tmp cache "sietch"
 
@@ -68,8 +76,11 @@ let _irmin (type t) cache
                      (Path.Build.local in_the_build_directory))
                   checksum basename
               ];
-          let contents = Io.read_file in_the_cache
-          and metadata = stats.st_perm land 0o100 != 0 in
+          let* contents =
+            let read () = Io.read_file in_the_cache |> Lwt.return in
+            Lwt_pool.use v.fd_pool read
+          in
+          let metadata = stats.st_perm land 0o100 != 0 in
           let+ new_tree =
             Store.Tree.add tree ~metadata [ Digest.to_string digest ] contents
           in
@@ -114,7 +125,7 @@ let _irmin (type t) cache
         in
         Irmin.Info.v ~author ~date message
       in
-      Store.with_tree ~info v [] insert |> convert_irmin_error
+      Store.with_tree ~info v.store [] insert |> convert_irmin_error
 
     let mkdir p =
       try%lwt Lwt_unix.mkdir p 0o700
@@ -135,9 +146,12 @@ let _irmin (type t) cache
             0o400
         in
         let* () =
-          let* output = Lwt_io.open_file ~perm ~mode:Lwt_io.output path_tmp in
-          let* () = Lwt_io.write output contents in
-          Lwt_io.close output
+          let write () =
+            let* output = Lwt_io.open_file ~perm ~mode:Lwt_io.output path_tmp in
+            let* () = Lwt_io.write output contents in
+            Lwt_io.close output
+          in
+          Lwt_pool.use v.fd_pool write
         and* () = mkdir dir in
         Lwt_unix.rename path_tmp path
       with
@@ -158,7 +172,7 @@ let _irmin (type t) cache
         of_path path |> Result.map ~f |> Lwt.return
       ) else
         let open LwtO in
-        Store.find_all v [ dir; Digest.to_string key ] >|= function
+        Store.find_all v.store [ dir; Digest.to_string key ] >|= function
         | None ->
           Log.info
             [ Pp.textf "%s file not found in the distributed cache: %s" t
@@ -251,11 +265,13 @@ let _irmin (type t) cache
         [ Pp.textf "add %s index for %s: %d entries" name (Digest.to_string key)
             (List.length keys)
         ];
-      Store.with_tree ~info v [ "indexes"; name ] add |> convert_irmin_error
+      Store.with_tree ~info v.store [ "indexes"; name ] add
+      |> convert_irmin_error
 
     let index_prefetch name key =
       let open LwtO in
-      Store.find_all v [ "indexes"; name; Digest.to_string key ] >>= function
+      Store.find_all v.store [ "indexes"; name; Digest.to_string key ]
+      >>= function
       | None ->
         Log.info
           [ Pp.textf "%s not found in index %s" (Digest.to_string key) name ];
