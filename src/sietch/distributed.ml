@@ -200,17 +200,24 @@ let _irmin (type t) cache
             path "files" f.digest
         in
         match contents with
-        | Some ((), Some contents) ->
+        | Some ((), Some contents) -> (
           let+ () = write_file path contents in
-          let checksum = Stdune.Digest.file_with_stats path (Path.stat path) in
-          if checksum <> f.digest then
-            Stdune.User_warning.emit
-              [ Pp.textf "checksum mismatch for %s: %s <> %s"
-                  (Path.Local.to_string
-                     (Path.Build.local f.in_the_build_directory))
-                  (Digest.to_string checksum)
-                  (Digest.to_string f.digest)
-              ]
+          try
+            let checksum =
+              Stdune.Digest.file_with_stats path (Path.stat path)
+            in
+            if checksum <> f.digest then
+              Stdune.User_warning.emit
+                [ Pp.textf "checksum mismatch for %s: %s <> %s"
+                    (Path.Local.to_string
+                       (Path.Build.local f.in_the_build_directory))
+                    (Digest.to_string checksum)
+                    (Digest.to_string f.digest)
+                ]
+          with Unix.Unix_error (Unix.ENOENT, _, _) ->
+            (* Can happen if multiple rules are fetching this file, this
+               iteration will silently skip it *)
+            () )
         | _ -> Lwt_result.return ()
       in
       let open LwtO in
