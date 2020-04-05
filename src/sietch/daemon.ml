@@ -257,6 +257,17 @@ let client_thread daemon client =
       | SetCommonMetadata metadata ->
         Lwt_result.return { client with common_metadata = metadata }
       | SetRepos repositories ->
+        let* () =
+          let module D = (val daemon.distributed) in
+          let f (repository : Cache.repository) =
+            D.index_prefetch commits_index_key (Digest.string repository.commit)
+          in
+          let%lwt results = Lwt_list.map_p f repositories in
+          Result.List.all results
+          |> Result.map ~f:(fun (_ : unit list) -> ())
+          |> Result.map_error ~f:(fun e -> `Distribution_error e)
+          |> Lwt.return
+        in
         let* client = index_commits daemon client in
         let cache = Cache.Local.with_repositories client.cache repositories
         and commits = Array.make (List.length repositories) [] in
@@ -268,6 +279,7 @@ let client_thread daemon client =
         let open Lwt_result.Infix in
         let open CSexp.IStream in
         let open LwtR in
+        Log.info [ Pp.textf "%s: read next command" (peer_name client.peer) ];
         peek input >>= function
         | None ->
           Log.info [ Pp.textf "%s: ended -" (peer_name client.peer) ];
@@ -290,17 +302,22 @@ let client_thread daemon client =
       in
       handle client
     and finally () =
+      Log.info [ Pp.textf "%s: cleanup" (peer_name client.peer) ];
       let open LwtO in
       let+ () = close_client_socket client.fd in
       let () = Cache.Local.teardown client.cache in
       daemon.event_push (Some (Client_left client.fd))
     in
-    try protect ~f ~finally with
+    try%lwt protect ~f ~finally with
     | Unix.Unix_error (Unix.EBADF, _, _) ->
-      Log.info [ Pp.textf "%s: ended -" (peer_name client.peer) ];
+      Log.info [ Pp.textf "%s: ended" (peer_name client.peer) ];
       Lwt_result.return client
-    | Sys_error msg ->
-      Log.info [ Pp.textf "%s: ended: %s" (peer_name client.peer) msg ];
+    | exn ->
+      Log.info
+        [ Pp.textf "%s: fatal error: %s" (peer_name client.peer)
+            (Printexc.to_string exn)
+        ; Pp.text (Printexc.get_backtrace ())
+        ];
       Lwt_result.return client
   with Code_error.E e as exn ->
     Log.info

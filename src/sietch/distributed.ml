@@ -145,8 +145,8 @@ let _irmin (type t) cache
         (* If the file exists with no write permissions, it is being pulled as
            part of another hinting. *)
         Lwt_result.return ()
-      | Unix.Unix_error (e, f, _) ->
-        Lwt_result.fail (Printf.sprintf "%s: %s" (Unix.error_message e) f)
+      | Unix.Unix_error (e, f, a) ->
+        Lwt_result.fail (Printf.sprintf "%s: %s %s" (Unix.error_message e) f a)
 
     let search_missing_file t ~of_path ~of_string path dir key =
       if Path.exists path then (
@@ -226,22 +226,21 @@ let _irmin (type t) cache
 
     let index_add name key keys =
       let open LwtO in
-      let add root =
-        let root =
-          match root with
+      let add index =
+        let index =
+          match index with
           | None -> Store.Tree.empty
           | Some tree -> tree
         in
-        let* index = find_or_create_tree root [ "indexes"; name ] in
         let contents =
           Csexp.to_string
             (Sexp.List
                (List.map ~f:(fun key -> Sexp.Atom (Digest.to_string key)) keys))
         in
-        let+ tree =
+        let+ index =
           Store.Tree.add index ~metadata:false [ Digest.to_string key ] contents
         in
-        Some tree
+        Some index
       and info () =
         let author = "sietch <https://github.com/ocaml/dune>"
         and date = Int64.of_float (Unix.gettimeofday ())
@@ -252,18 +251,16 @@ let _irmin (type t) cache
         [ Pp.textf "add %s index for %s: %d entries" name (Digest.to_string key)
             (List.length keys)
         ];
-      Store.with_tree ~info v [] add |> convert_irmin_error
+      Store.with_tree ~info v [ "indexes"; name ] add |> convert_irmin_error
 
     let index_prefetch name key =
       let open LwtO in
       Store.find_all v [ "indexes"; name; Digest.to_string key ] >>= function
       | None ->
         Log.info
-          [ Pp.textf "%s not found index %s" (Digest.to_string key) name ];
+          [ Pp.textf "%s not found in index %s" (Digest.to_string key) name ];
         Lwt_result.return ()
       | Some (contents, _) -> (
-        Log.info
-          [ Pp.textf "retrieved %s from index %s" (Digest.to_string key) name ];
         match Csexp.parse_string contents with
         | Result.Ok (Sexp.List keys) ->
           let f = function
@@ -278,6 +275,10 @@ let _irmin (type t) cache
                 (Format.sprintf "invalid key in index file: %s"
                    (Sexp.to_string sexp))
           in
+          Log.info
+            [ Pp.textf "retrieve %s from index %s: %d entries"
+                (Digest.to_string key) name (List.length keys)
+            ];
           Lwt_list.map_p f keys
           |> Lwt.map (fun l -> Result.List.all l |> Result.map ~f:ignore)
         | _ -> Lwt_result.fail "invalid index file" )
