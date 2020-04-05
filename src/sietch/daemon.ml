@@ -167,13 +167,13 @@ let client_handle peer version output = function
 
 let protect ~f ~finally =
   let open LwtO in
-  try
+  try%lwt
     let* res = f () in
     let+ () = finally () in
     res
   with e ->
     let* () = finally () in
-    raise e
+    Lwt.fail e
 
 let outgoing_message_of_sexp version sexp =
   outgoing_message_of_sexp version sexp
@@ -335,7 +335,7 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
   in
   let rec accept_thread sock =
     let rec accept () =
-      try Lwt_unix.accept sock
+      try%lwt Lwt_unix.accept sock
       with Unix.Unix_error (Unix.EINTR, _, _) -> (accept [@tailcall]) ()
     in
     let open LwtO in
