@@ -35,7 +35,12 @@ let _irmin (type t) cache
     include Store
 
     let convert_irmin_error =
-      Lwt.map (Result.map_error ~f:(fun _ -> "FIXME irmin write error"))
+      let f = function
+        | `Conflict reason -> Format.sprintf "Irmin conflict: %s" reason
+        | `Test_was _ -> Format.sprintf "Irmin test_was"
+        | `Too_many_retries i -> Format.sprintf "Irmin too many retries: %d" i
+      in
+      Lwt.map (Result.map_error ~f)
 
     let compare_trees l r = Store.Tree.hash l = Store.Tree.hash r
 
