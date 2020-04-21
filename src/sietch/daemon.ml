@@ -114,7 +114,8 @@ exception Error of string
 let make ?root ~config () =
   match
     Cache.Local.make ?root ~duplication_mode:Cache.Duplication_mode.Hardlink
-      (fun _ -> ())
+      ~command_handler:(fun _ -> ())
+      ()
   with
   | Result.Error msg -> Lwt_result.fail (`Local_cache_error msg)
   | Result.Ok cache ->
@@ -269,8 +270,12 @@ let client_thread daemon client =
           |> Lwt.return
         in
         let* client = index_commits daemon client in
-        let cache = Cache.Local.with_repositories client.cache repositories
-        and commits = Array.make (List.length repositories) [] in
+        let* cache =
+          Cache.Local.with_repositories client.cache repositories
+          |> Result.map_error ~f:(fun s -> `Remote_cache_error s)
+          |> Lwt.return
+        in
+        let commits = Array.make (List.length repositories) [] in
         Lwt_result.return { client with cache; commits; repositories }
     in
     let input = client.input in
@@ -335,7 +340,7 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
       let* () = Lwt_unix.sleep period in
       let () =
         match
-          let size = Cache.Local.size cache in
+          let size = Cache.Local.overhead_size cache in
           if size > max_size then (
             Log.info [ Pp.textf "trimming %i bytes" (size - max_size) ];
             Some (Cache.Local.trim cache (size - max_size))
@@ -418,7 +423,7 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
           |> Lwt.return
         in
         let* version =
-          highest_common_version my_versions their_versions
+          find_newest_common_version my_versions their_versions
           |> Result.map_error ~f:(fun _ ->
                  `Version_mismatch (my_versions, their_versions))
           |> Lwt.return
@@ -432,7 +437,8 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
             match
               Cache.Local.make ~root:daemon.root
                 ~duplication_mode:Cache.Duplication_mode.Hardlink
-                (client_handle peer version output)
+                ~command_handler:(client_handle peer version output)
+                ()
             with
             | Result.Ok m -> m
             | Result.Error e -> User_error.raise [ Pp.textf "%s" e ]
@@ -453,6 +459,7 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
           client_thread daemon client >|= function
           | Result.Ok _ -> ()
           | Result.Error (`Distribution_error e)
+          | Result.Error (`Remote_cache_error e)
           | Result.Error (`Local_cache_error e)
           | Result.Error (`Parse_error e)
           | Result.Error (`Protocol_error e)

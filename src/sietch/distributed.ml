@@ -204,7 +204,7 @@ let _irmin (type t) cache
 
     let rec prefetch key =
       let open LwtrO in
-      let path = Cache.Local.path_metadata cache key in
+      let path = Cache.Local.metadata_path cache key in
       let* metadata =
         search_missing_file "metadata" ~of_path:Metadata_file.parse
           ~of_string:Metadata_file.of_string path "meta" key
@@ -223,7 +223,7 @@ let _irmin (type t) cache
     and prefetch_data (metadata : Metadata_file.t) =
       let open LwtrO in
       let retrieve_file (f : File.t) =
-        let path = Cache.Local.path_data cache f.digest in
+        let path = Cache.Local.file_path cache f.digest in
         let path = Path.of_string (Path.to_string path ^ ".1") in
         let* contents =
           search_missing_file "data"

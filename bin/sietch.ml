@@ -32,7 +32,11 @@ let default =
   in
   (term, Term.info "sietch" ~doc ~man)
 
-let path_conv = ((fun s -> `Ok (Path.of_string s)), Path.pp)
+let path_conv =
+  let pp formatter path =
+    Format.pp_print_string formatter @@ Path.to_string path
+  in
+  ((fun s -> `Ok (Path.of_string s)), pp)
 
 let port_path =
   Arg.(
@@ -67,18 +71,20 @@ let start =
     let show_endpoint ep = Printf.printf "%s\n%!" ep
     and config : Sietch.Daemon.config = { exit_no_client } in
     let f started =
-      let started content =
-        if foreground then show_endpoint content;
-        started content
+      let started daemon_info =
+        if foreground then show_endpoint daemon_info;
+        started ~daemon_info
       in
       Sietch.Daemon.daemon ~root ~config started
     in
     match Daemonize.daemonize ~workdir:root ~foreground port_path f with
     | Result.Ok Finished -> ()
-    | Result.Ok (Daemonize.Started (endpoint, _)) -> show_endpoint endpoint
-    | Result.Ok (Daemonize.Already_running (endpoint, _)) when not foreground ->
+    | Result.Ok (Daemonize.Started { daemon_info = endpoint; _ }) ->
       show_endpoint endpoint
-    | Result.Ok (Daemonize.Already_running (endpoint, pid)) ->
+    | Result.Ok (Daemonize.Already_running { daemon_info = endpoint; _ })
+      when not foreground ->
+      show_endpoint endpoint
+    | Result.Ok (Daemonize.Already_running { daemon_info = endpoint; pid }) ->
       User_error.raise
         [ Pp.textf "already running on %s (PID %i)" endpoint (Pid.to_int pid) ]
     | Result.Error reason -> User_error.raise [ Pp.text reason ]
@@ -99,6 +105,7 @@ let stop =
 let commands = [ start; stop ]
 
 let () =
+  Printexc.record_backtrace true;
   let () =
     Dune_util.Log.init
       ~file:(Dune_util.Log.File.This (Path.of_string "/dev/stdout"))
