@@ -256,22 +256,55 @@ let _irmin (type t) cache
       let+ results = Lwt_list.map_p retrieve_file metadata.files in
       Result.List.iter ~f:(fun r -> r) results
 
+    module Digests = Set.Make (Digest) (Map.Make (Digest))
+
+    let parse_index contents =
+      match Csexp.parse_string contents with
+      | Result.Ok (Sexp.List keys) ->
+        let f = function
+          | Sexp.Atom key -> (
+            match Digest.from_hex key with
+            | Some key -> Result.Ok key
+            | None -> Result.Error (Format.sprintf "invalid key: %s" key) )
+          | sexp ->
+            Result.Error
+              (Format.sprintf "invalid key: %s" (Sexp.to_string sexp))
+        in
+        Result.List.map ~f keys
+      | _ -> Result.Error "parse error"
+
     let index_add name key keys =
       let open LwtO in
+      let path = [ Digest.to_string key ] in
       let add index =
         let index =
           match index with
           | None -> Store.Tree.empty
           | Some tree -> tree
         in
+        let* keys =
+          let+ contents = Store.Tree.find index path in
+          match contents with
+          | Some contents -> (
+            match parse_index contents with
+            | Result.Ok l ->
+              let previous = Digests.of_list l
+              and keys = Digests.of_list keys in
+              Digests.union previous keys |> Digests.to_list
+            | Result.Error reason ->
+              Stdune.User_warning.emit
+                [ Pp.textf "dropping invalid index file in index %s for %s: %s"
+                    name (Digest.to_string key) reason
+                ];
+              keys )
+          | None -> keys
+        in
         let contents =
           Csexp.to_string
             (Sexp.List
                (List.map ~f:(fun key -> Sexp.Atom (Digest.to_string key)) keys))
         in
-        let+ index =
-          Store.Tree.add index ~metadata:false [ Digest.to_string key ] contents
-        in
+        let+ index = Store.Tree.add index ~metadata:false path contents in
         Some index
       and info () =
         let author = "sietch <https://github.com/ocaml/dune>"
@@ -295,27 +328,20 @@ let _irmin (type t) cache
           [ Pp.textf "%s not found in index %s" (Digest.to_string key) name ];
         Lwt_result.return ()
       | Some (contents, _) -> (
-        match Csexp.parse_string contents with
-        | Result.Ok (Sexp.List keys) ->
-          let f = function
-            | Sexp.Atom key -> (
-              match Digest.from_hex key with
-              | Some key -> prefetch key
-              | None ->
-                Lwt_result.fail
-                  (Format.sprintf "invalid key in index file: %s" key) )
-            | sexp ->
-              Lwt_result.fail
-                (Format.sprintf "invalid key in index file: %s"
-                   (Sexp.to_string sexp))
-          in
+        match parse_index contents with
+        | Result.Ok keys ->
           Log.info
             [ Pp.textf "retrieve %s from index %s: %d entries"
                 (Digest.to_string key) name (List.length keys)
             ];
-          Lwt_list.map_p f keys
+          Lwt_list.map_p prefetch keys
           |> Lwt.map (fun l -> Result.List.all l |> Result.map ~f:ignore)
-        | _ -> Lwt_result.fail "invalid index file" )
+        | Result.Error reason ->
+          Stdune.User_warning.emit
+            [ Pp.textf "ignoring invalid index file in index %s for %s: %s" name
+                (Digest.to_string key) reason
+            ];
+          Lwt_result.return () )
   end : S )
 
 module Metadata = struct
