@@ -69,25 +69,13 @@ let _irmin (type t) cache
           match root with
           | None -> Store.Tree.empty
           | Some tree -> tree
-        and insert_file (tree, count)
-            { File.digest; in_the_cache; in_the_build_directory } =
-          let stats = Path.stat in_the_cache in
-          let checksum =
-            Stdune.Digest.file_with_stats in_the_cache stats
-            |> Stdune.Digest.to_string
-          and basename = Path.basename in_the_cache in
-          if checksum ^ ".1" <> basename then
-            Stdune.User_warning.emit
-              [ Pp.textf "checksum mismatch for %s: %s <> %s"
-                  (Path.Local.to_string
-                     (Path.Build.local in_the_build_directory))
-                  checksum basename
-              ];
+        and insert_file (tree, count) { File.digest; _ } =
+          let path = Cache.Local.file_path cache digest in
+          let stats = Path.stat path in
           let* contents =
             let read () =
               let* file =
-                Lwt_io.open_file ~mode:Lwt_io.input
-                  (Path.to_string in_the_cache)
+                Lwt_io.open_file ~mode:Lwt_io.input (Path.to_string path)
               in
               let* contents = Lwt_io.read file in
               let+ () = Lwt_io.close file in
@@ -232,24 +220,7 @@ let _irmin (type t) cache
             path "files" f.digest
         in
         match contents with
-        | Some ((), Some contents) -> (
-          let+ () = write_file path contents in
-          try
-            let checksum =
-              Stdune.Digest.file_with_stats path (Path.stat path)
-            in
-            if checksum <> f.digest then
-              Stdune.User_warning.emit
-                [ Pp.textf "checksum mismatch for %s: %s <> %s"
-                    (Path.Local.to_string
-                       (Path.Build.local f.in_the_build_directory))
-                    (Digest.to_string checksum)
-                    (Digest.to_string f.digest)
-                ]
-          with Unix.Unix_error (Unix.ENOENT, _, _) ->
-            (* Can happen if multiple rules are fetching this file, this
-               iteration will silently skip it *)
-            () )
+        | Some ((), Some contents) -> write_file path contents
         | _ -> Lwt_result.return ()
       in
       let open LwtO in
