@@ -212,7 +212,6 @@ let _irmin (type t) cache
       let open LwtrO in
       let retrieve_file (f : File.t) =
         let path = Cache.Local.file_path cache f.digest in
-        let path = Path.of_string (Path.to_string path ^ ".1") in
         let* contents =
           search_missing_file "data"
             ~of_path:(fun _ -> Result.Ok ())
