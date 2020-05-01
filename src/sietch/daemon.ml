@@ -107,9 +107,16 @@ type t =
   ; event_push : event option -> unit
   ; cache : Cache.Local.t
   ; distributed : (module Distributed.S)
+  ; distribution : (Cache.Key.t * Cache.Local.Metadata_file.t) Lwt_stream.t
+  ; distribute : (Cache.Key.t * Cache.Local.Metadata_file.t) option -> unit
+  ; distribution_barrier : Barrier.t
   }
 
 exception Error of string
+
+let log_error context op = function
+  | Result.Ok () -> ()
+  | Result.Error e -> Log.info [ Pp.textf "%s: %s error: %s" context op e ]
 
 let make ?root ~config () =
   match
@@ -119,7 +126,21 @@ let make ?root ~config () =
   with
   | Result.Error msg -> Lwt_result.fail (`Local_cache_error msg)
   | Result.Ok cache ->
-    let events, event_push = Lwt_stream.create () in
+    let events, event_push = Lwt_stream.create ()
+    and distribution, distribute = Lwt_stream.create ()
+    and distributed = Distributed.irmin cache
+    and distribution_barrier = Barrier.make () in
+    let rec distribution_thread () =
+      let%lwt () = Barrier.wait distribution_barrier in
+      match%lwt Lwt_stream.get distribution with
+      | Some (key, metadata) ->
+        let module D = (val distributed) in
+        let%lwt res = D.distribute key metadata in
+        log_error (Digest.to_string key) "distribute" res;
+        distribution_thread ()
+      | None -> Lwt.return ()
+    in
+    Lwt.async distribution_thread;
     Lwt_result.return
       { root = Option.value root ~default:(Cache.Local.default_root ())
       ; socket = None
@@ -131,7 +152,10 @@ let make ?root ~config () =
       ; events
       ; event_push
       ; cache
-      ; distributed = Distributed.irmin cache
+      ; distributed
+      ; distribution
+      ; distribute
+      ; distribution_barrier
       }
 
 let getsockname = function
@@ -206,12 +230,7 @@ let index_commits { distributed = (module Distributed); _ }
 
 let client_thread daemon client =
   try
-    let handle_cmd (client : client) sexp =
-      let log_error op = function
-        | Result.Ok () -> ()
-        | Result.Error e ->
-          Log.info [ Pp.textf "%s: %s error: %s" (peer_name client.peer) op e ]
-      in
+    let handle_cmd (client : client) sexp () =
       let open LwtR in
       let* msg = outgoing_message_of_sexp client.version sexp |> Lwt.return in
       match msg with
@@ -221,7 +240,8 @@ let client_thread daemon client =
         let f k = D.prefetch k in
         let prefetching () =
           let* results = Lwt_list.map_s f keys in
-          List.iter ~f:(log_error "distribute") results |> Lwt.return
+          List.iter ~f:(log_error (peer_name client.peer) "distribute") results
+          |> Lwt.return
         in
         Lwt.async prefetching;
         Lwt_result.return client
@@ -234,14 +254,7 @@ let client_thread daemon client =
             |> Result.map_error ~f:(fun e -> `Distribution_error e)
             |> Lwt.return
           in
-          let () =
-            let distribute () =
-              let module D = (val daemon.distributed) in
-              let%lwt res = D.distribute key metadata in
-              res |> log_error "distribute" |> Lwt.return
-            in
-            Lwt.async distribute
-          in
+          let () = daemon.distribute (Some (key, metadata)) in
           let register_commit repository =
             client.commits.(repository) <- key :: client.commits.(repository)
           in
@@ -302,7 +315,9 @@ let client_thread daemon client =
                  ++ Pp.space
                  ++ Pp.hbox (Pp.text @@ Sexp.to_string cmd)
             ];
-          let* client = handle_cmd client cmd in
+          let* client =
+            Barrier.use daemon.distribution_barrier (handle_cmd client cmd)
+          in
           (handle [@tailcall]) client
       in
       handle client
