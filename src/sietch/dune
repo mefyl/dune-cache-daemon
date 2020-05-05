@@ -1,9 +1,9 @@
 (include_subdirs unqualified)
 
 (library
- (name sietch)
+ (name dune_cache_daemon)
  (libraries csexp dune-private-libs.cache dune-private-libs.stdune irmin
-   irmin-mem lwt lwt.unix)
+   irmin-mem lwt lwt.unix git-unix irmin-git)
  (synopsis "Dune distributed binary artifacts cache")
  (preprocess
   (pps lwt_ppx)))

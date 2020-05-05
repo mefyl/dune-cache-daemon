@@ -1,13 +1,13 @@
 module Evt = Event
 module Utils = Utils
 module Log = Dune_util.Log
-module Csexp_sietch = Csexp
+module Csexp_dune_cache_daemon = Csexp
 open Stdune
 open Utils
 open Cache.Messages
 open Result.O
 open Pp.O
-module CSexp = Csexp_sietch.Lwt
+module CSexp = Csexp_dune_cache_daemon.Lwt
 
 type error =
   [ `Local_cache_error of string
@@ -29,6 +29,10 @@ type client =
   ; repositories : Cache.repository list
   ; version : version
   }
+
+let info = Log.info
+
+let debug = ignore
 
 let default_port_file () =
   let runtime_dir =
@@ -116,7 +120,7 @@ exception Error of string
 
 let log_error context op = function
   | Result.Ok () -> ()
-  | Result.Error e -> Log.info [ Pp.textf "%s: %s error: %s" context op e ]
+  | Result.Error e -> info [ Pp.textf "%s: %s error: %s" context op e ]
 
 let make ?root ~config () =
   match
@@ -128,12 +132,21 @@ let make ?root ~config () =
   | Result.Ok cache ->
     let events, event_push = Lwt_stream.create ()
     and distribution, distribute = Lwt_stream.create ()
-    and distributed = Distributed.irmin cache
+    and distributed = Distributed.irmin_git cache (Path.of_string "/tmp/dune_cache_daemon")
     and distribution_barrier = Barrier.make () in
     let rec distribution_thread () =
       let%lwt () = Barrier.wait distribution_barrier in
+      let%lwt was_stopped =
+        let%lwt empty = Lwt_stream.is_empty distribution in
+        if empty then
+          let () = info [ Pp.textf "done distributing" ] in
+          Lwt.return true
+        else
+          Lwt.return false
+      in
       match%lwt Lwt_stream.get distribution with
       | Some (key, metadata) ->
+        if was_stopped then info [ Pp.textf "start distributing" ];
         let module D = (val distributed) in
         let%lwt res = D.distribute key metadata in
         log_error (Digest.to_string key) "distribute" res;
@@ -179,7 +192,7 @@ let client_handle peer version output = function
       and f = function
         | Result.Ok () -> ()
         | Result.Error (`Write_error e) ->
-          Log.info [ Pp.textf "%s: write error: %s" (peer_name peer) e ]
+          info [ Pp.textf "%s: write error: %s" (peer_name peer) e ]
       in
       Lwt.map f sent
     in
@@ -297,10 +310,10 @@ let client_thread daemon client =
         let open Lwt_result.Infix in
         let open CSexp.IStream in
         let open LwtR in
-        Log.info [ Pp.textf "%s: read next command" (peer_name client.peer) ];
+        debug [ Pp.textf "%s: read next command" (peer_name client.peer) ];
         peek input >>= function
         | None ->
-          Log.info [ Pp.textf "%s: ended -" (peer_name client.peer) ];
+          debug [ Pp.textf "%s: ended" (peer_name client.peer) ];
           let* client = index_commits daemon client in
           Lwt_result.return client
         | Some '\n' ->
@@ -309,7 +322,7 @@ let client_thread daemon client =
           (handle [@tailcall]) client
         | _ ->
           let* cmd = CSexp.parse input in
-          Log.info
+          debug
             [ Pp.box ~indent:2
               @@ Pp.textf "%s: received command" (peer_name client.peer)
                  ++ Pp.space
@@ -322,7 +335,7 @@ let client_thread daemon client =
       in
       handle client
     and finally () =
-      Log.info [ Pp.textf "%s: cleanup" (peer_name client.peer) ];
+      debug [ Pp.textf "%s: cleanup" (peer_name client.peer) ];
       let open LwtO in
       let+ () = close_client_socket client.fd in
       let () = Cache.Local.teardown client.cache in
@@ -330,17 +343,17 @@ let client_thread daemon client =
     in
     try%lwt protect ~f ~finally with
     | Unix.Unix_error (Unix.EBADF, _, _) ->
-      Log.info [ Pp.textf "%s: ended" (peer_name client.peer) ];
+      info [ Pp.textf "%s: ended" (peer_name client.peer) ];
       Lwt_result.return client
     | exn ->
-      Log.info
+      info
         [ Pp.textf "%s: fatal error: %s" (peer_name client.peer)
             (Printexc.to_string exn)
         ; Pp.text (Printexc.get_backtrace ())
         ];
       Lwt_result.return client
   with Code_error.E e as exn ->
-    Log.info
+    info
       [ Pp.textf "%s: fatal error: %s" (peer_name client.peer)
           (Dyn.to_string (Code_error.to_dyn e))
       ];
@@ -357,14 +370,14 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
         match
           let size = Cache.Local.overhead_size cache in
           if size > max_size then (
-            Log.info [ Pp.textf "trimming %i bytes" (size - max_size) ];
+            info [ Pp.textf "trimming %i bytes" (size - max_size) ];
             Some (Cache.Local.trim cache (size - max_size))
           ) else
             None
         with
         | Some { trimmed_files_size = freed; _ } ->
-          Log.info [ Pp.textf "trimming freed %i bytes" freed ]
-        | None -> Log.info [ Pp.textf "skip trimming" ]
+          info [ Pp.textf "trimming freed %i bytes" freed ]
+        | None -> debug [ Pp.textf "skip trimming" ]
       in
       trim ()
     in
@@ -396,7 +409,7 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
   daemon.trim_thread <- Some (trim_thread trim_size trim_period daemon.cache);
   let rec handle () =
     let stop () =
-      Log.info [ Pp.textf "stop" ];
+      info [ Pp.textf "stop" ];
       let+ () =
         match daemon.socket with
         | Some fd ->
@@ -421,7 +434,7 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
       let input = Lwt_io.of_fd ~mode:Lwt_io.input fd |> CSexp.IStream.make
       and output = Lwt_io.of_fd ~mode:Lwt_io.output fd |> CSexp.OStream.make in
       let* res =
-        Log.info [ Pp.textf "accept new client %s" (peer_name peer) ];
+        info [ Pp.textf "accept new client %s" (peer_name peer) ];
         let open LwtR in
         let* () =
           let version_message =
@@ -443,7 +456,7 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
                  `Version_mismatch (my_versions, their_versions))
           |> Lwt.return
         in
-        Log.info
+        debug
           [ Pp.textf "negotiated protocol version %s"
             @@ Cache.Messages.string_of_version version
           ];
@@ -479,7 +492,7 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
           | Result.Error (`Parse_error e)
           | Result.Error (`Protocol_error e)
           | Result.Error (`Read_error e) ->
-            Log.info [ Pp.textf "%s: client error: %s" (peer_name peer) e ]
+            info [ Pp.textf "%s: client error: %s" (peer_name peer) e ]
         in
         match Clients.add daemon.clients client.fd (client, thread) with
         | Result.Ok clients ->
@@ -496,9 +509,9 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
           | `Protocol_error msg
           | `Read_error msg
           | `Write_error msg ->
-            Log.info [ Pp.textf "reject client: %s" msg ]
+            info [ Pp.textf "reject client: %s" msg ]
           | `Version_mismatch _ ->
-            Log.info [ Pp.textf "reject client: version mismatch" ] );
+            info [ Pp.textf "reject client: version mismatch" ] );
           close_client_socket fd
       in
       (handle [@tailcall]) ()
@@ -520,14 +533,14 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
 let () = Logs.set_reporter (Logs.format_reporter ())
 
 let daemon ~root ~config started =
-  let sietch =
+  let dune_cache_daemon =
     let open LwtR in
     Path.mkdir_p root;
     let* daemon = make ~root ~config () in
     (* Event blocks signals when waiting. Use a separate thread to catch
        signals. *)
     let signal_handler s =
-      Log.info [ Pp.textf "caught signal %i, exiting" (-s) ];
+      info [ Pp.textf "caught signal %i, exiting" (-s) ];
       daemon.event_push (Some Stop)
     and signals = [ Sys.sigint; Sys.sigterm ] in
     let _ =
@@ -537,7 +550,7 @@ let daemon ~root ~config started =
     let ran = run ~port_f:started daemon in
     Lwt.map Result.ok ran
   in
-  match Lwt_main.run sietch with
+  match Lwt_main.run dune_cache_daemon with
   | Result.Ok () -> ()
   | Result.Error (`Fatal e)
   | Result.Error (`Local_cache_error e) ->

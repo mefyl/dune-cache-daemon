@@ -1,18 +1,18 @@
 (rule
  (with-stdout-to
-  sietch.1
-  (run %{bin:sietch} --help=groff)))
+  dune-cache-daemon.1
+  (run %{bin:dune-cache-daemon} --help=groff)))
 
 (install
  (section man)
- (files sietch.1))
+ (files dune-cache-daemon.1))
 
-(include sietch.inc)
+(include dune-cache-daemon.inc)
 
 (rule
  (alias runtest)
  (mode promote)
  (action
   (with-stdout-to
-   sietch.inc
-   (run bash %{dep:update-man.sh} %{bin:sietch}))))
+   dune-cache-daemon.inc
+   (run bash %{dep:update-man.sh} %{bin:dune-cache-daemon}))))

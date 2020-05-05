@@ -9,7 +9,7 @@ let man =
   [ `S "DESCRIPTION"
   ; `P
       {|Dune is able to share build artifacts between workspaces.
-        $(b,sietch) is a daemon that runs in the background
+        $(b,dune_cache_daemon) is a daemon that runs in the background
         and manages this shared cache. For instance, it makes sure that it
         does not grow too big and try to maximise sharing between the various
         workspace that are using the shared cache.|}
@@ -30,7 +30,7 @@ let default =
     @@ let+ _ = Term.const () in
        `Help (`Pager, None)
   in
-  (term, Term.info "sietch" ~doc ~man)
+  (term, Term.info "dune_cache_daemon" ~doc ~man)
 
 let path_conv =
   let pp formatter path =
@@ -41,7 +41,7 @@ let path_conv =
 let port_path =
   Arg.(
     value
-    & opt path_conv (Sietch.Daemon.default_port_file ())
+    & opt path_conv (Dune_cache_daemon.Daemon.default_port_file ())
     & info ~docv:"PATH" [ "port-file" ]
         ~doc:"The file to read/write the daemon port to/from.")
 
@@ -69,13 +69,13 @@ let start =
         & info ~docv:"PATH" [ "root" ] ~doc:"Root of the dune cache")
     in
     let show_endpoint ep = Printf.printf "%s\n%!" ep
-    and config : Sietch.Daemon.config = { exit_no_client } in
+    and config : Dune_cache_daemon.Daemon.config = { exit_no_client } in
     let f started =
       let started daemon_info =
         if foreground then show_endpoint daemon_info;
         started ~daemon_info
       in
-      Sietch.Daemon.daemon ~root ~config started
+      Dune_cache_daemon.Daemon.daemon ~root ~config started
     in
     match Daemonize.daemonize ~workdir:root ~foreground port_path f with
     | Result.Ok Finished -> ()

@@ -1,5 +1,5 @@
 (executable
- (name sietch)
- (public_name sietch)
- (libraries cmdliner sietch)
+ (name main)
+ (public_name dune-cache-daemon)
+ (libraries cmdliner dune_cache_daemon)
  (preprocess future_syntax))

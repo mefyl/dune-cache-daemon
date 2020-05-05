@@ -24,13 +24,18 @@ let disabled =
     let index_prefetch _ _ = Lwt_result.return ()
   end : S )
 
+let info = Log.info
+
+let debug = ignore
+
 let _irmin (type t) cache
     (module Store : Irmin.S
       with type t = t
        and type step = string
        and type key = string list
        and type contents = string
-       and type metadata = bool) (store : t Lwt.t) =
+       and type metadata = [ `Everybody | `Exec | `Link | `Normal ])
+    (store : t Lwt.t) =
   ( module struct
     include Store
 
@@ -56,7 +61,7 @@ let _irmin (type t) cache
       ; store = Lwt_main.run store
       }
 
-    let tmp = Cache.Local.path_tmp cache "sietch"
+    let tmp = Cache.Local.path_tmp cache "dune_cache_daemon"
 
     let find_or_create_tree tree path =
       Store.Tree.find_tree tree path
@@ -83,7 +88,12 @@ let _irmin (type t) cache
             in
             Lwt_pool.use v.fd_pool read
           in
-          let metadata = stats.st_perm land 0o100 != 0 in
+          let metadata =
+            if stats.st_perm land 0o100 != 0 then
+              `Exec
+            else
+              `Normal
+          in
           let+ new_tree =
             Store.Tree.add tree ~metadata [ Digest.to_string digest ] contents
           in
@@ -91,7 +101,7 @@ let _irmin (type t) cache
           if compare_trees new_tree tree then
             (new_tree, count)
           else (
-            Log.info
+            debug
               [ Pp.textf "distribute data file %s" (Digest.to_string digest) ];
             (new_tree, count + 1)
           )
@@ -109,7 +119,7 @@ let _irmin (type t) cache
           if compare_trees new_tree tree_metadata then
             (new_tree, false)
           else (
-            Log.info
+            debug
               [ Pp.textf "distribute metadata file %s" (Digest.to_string key) ];
             (new_tree, true)
           )
@@ -121,7 +131,7 @@ let _irmin (type t) cache
         else
           Lwt.return (Some root)
       and info () =
-        let author = "sietch <https://github.com/ocaml/dune>"
+        let author = "dune_cache_daemon <https://github.com/ocaml/dune>"
         and date = Int64.of_float (Unix.gettimeofday ())
         and message =
           Format.asprintf "Promotion of rule %s" (Digest.to_string key)
@@ -137,7 +147,7 @@ let _irmin (type t) cache
       try%lwt Lwt_unix.mkdir p 0o700
       with Unix.Unix_error (Unix.EEXIST, _, _) -> Lwt.return ()
 
-    let write_file path (contents, executable) =
+    let write_file path (contents, metadata) =
       try%lwt
         Lwt.map Result.ok
         @@
@@ -146,7 +156,7 @@ let _irmin (type t) cache
           path |> Path.basename |> Path.relative tmp |> Path.to_string
         and path = path |> Path.to_string
         and perm =
-          if executable then
+          if metadata = `Exec then
             0o500
           else
             0o400
@@ -170,7 +180,7 @@ let _irmin (type t) cache
 
     let search_missing_file t ~of_path ~of_string path dir key =
       if Path.exists path then (
-        Log.info
+        debug
           [ Pp.textf "%s file already present locally: %s" t
               (Digest.to_string key)
           ];
@@ -180,13 +190,13 @@ let _irmin (type t) cache
         let open LwtO in
         Store.find_all v.store [ dir; Digest.to_string key ] >|= function
         | None ->
-          Log.info
+          debug
             [ Pp.textf "%s file not found in the distributed cache: %s" t
                 (Digest.to_string key)
             ];
           Result.Ok None
         | Some (contents, metadata) ->
-          Log.info [ Pp.textf "retrieved %s file %s" t (Digest.to_string key) ];
+          debug [ Pp.textf "retrieved %s file %s" t (Digest.to_string key) ];
           let f d = Some (d, Some (contents, metadata)) in
           of_string contents |> Result.map ~f
 
@@ -274,19 +284,19 @@ let _irmin (type t) cache
             (Sexp.List
                (List.map ~f:(fun key -> Sexp.Atom (Digest.to_string key)) keys))
         in
-        let+ index = Store.Tree.add index ~metadata:false path contents in
+        let+ index = Store.Tree.add index ~metadata:`Normal path contents in
         Some index
-      and info () =
-        let author = "sietch <https://github.com/ocaml/dune>"
+      and commit_info () =
+        let author = "dune_cache_daemon <https://github.com/ocaml/dune>"
         and date = Int64.of_float (Unix.gettimeofday ())
         and message = Format.asprintf "Indexing of %s" (Digest.to_string key) in
         Irmin.Info.v ~author ~date message
       in
-      Log.info
+      info
         [ Pp.textf "add %s index for %s: %d entries" name (Digest.to_string key)
             (List.length keys)
         ];
-      Store.with_tree ~info v.store [ "indexes"; name ] add
+      Store.with_tree ~info:commit_info v.store [ "indexes"; name ] add
       |> convert_irmin_error
 
     let index_prefetch name key =
@@ -294,13 +304,12 @@ let _irmin (type t) cache
       Store.find_all v.store [ "indexes"; name; Digest.to_string key ]
       >>= function
       | None ->
-        Log.info
-          [ Pp.textf "%s not found in index %s" (Digest.to_string key) name ];
+        info [ Pp.textf "%s not found in index %s" (Digest.to_string key) name ];
         Lwt_result.return ()
       | Some (contents, _) -> (
         match parse_index contents with
         | Result.Ok keys ->
-          Log.info
+          info
             [ Pp.textf "retrieve %s from index %s: %d entries"
                 (Digest.to_string key) name (List.length keys)
             ];
@@ -315,11 +324,28 @@ let _irmin (type t) cache
   end : S )
 
 module Metadata = struct
-  type t = bool
+  type t =
+    [ `Everybody
+    | `Exec
+    | `Link
+    | `Normal
+    ]
 
-  let t = Irmin.Type.bool
+  let t =
+    let open Irmin.Type in
+    variant "metadata" (fun everybody exec link normal ->
+      function
+      | `Everybody -> everybody
+      | `Exec -> exec
+      | `Link -> link
+      | `Normal -> normal)
+    |~ case0 "Everybody" `Everybody
+    |~ case0 "Exec" `Exec
+    |~ case0 "Link" `Link
+    |~ case0 "Normal" `Normal
+    |> sealv
 
-  let default = false
+  let default = `Normal
 
   let merge =
     Irmin.Merge.v t (fun ~old:_ l r ->
@@ -341,25 +367,25 @@ let irmin local =
   in
   _irmin local (module Store) store
 
-(* module GitFS = struct
- *   include Git_unix.Store
- *
- *   let v ?dotgit ?compression ?buffers root =
- *     let buffer =
- *       match buffers with
- *       | None -> None
- *       | Some p -> Some (Lwt_pool.use p)
- *     in
- *     v ?dotgit ?compression ?buffer root
- * end
- *
- * let irmin_git local path =
- *   let module Store =
- *     Irmin_git.KV (GitFS) (Git_unix.Sync (GitFS)) (Irmin.Contents.String)
- *   in
- *   let store =
- *     let open Lwt.Infix in
- *     Store.Repo.v (Irmin_git.config ~bare:false path) >>= fun repo ->
- *     Store.master repo
- *   in
- *   _irmin local (module Store) store *)
+module GitFS = struct
+  include Git_unix.Store
+
+  let v ?dotgit ?compression ?buffers root =
+    let buffer =
+      match buffers with
+      | None -> None
+      | Some p -> Some (Lwt_pool.use p)
+    in
+    v ?dotgit ?compression ?buffer root
+end
+
+let irmin_git local path =
+  let module Store =
+    Irmin_git.KV (GitFS) (Git_unix.Sync (GitFS)) (Irmin.Contents.String)
+  in
+  let store =
+    let open Lwt.Infix in
+    Store.Repo.v (Irmin_git.config ~bare:false (Path.to_string path))
+    >>= fun repo -> Store.master repo
+  in
+  _irmin local (module Store) store
