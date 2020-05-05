@@ -45,12 +45,63 @@ let port_path =
     & info ~docv:"PATH" [ "port-file" ]
         ~doc:"The file to read/write the daemon port to/from.")
 
+module Distribution = struct
+  type t =
+    | Disabled
+    | Memory
+    | Git of Path.t
+
+  let schemes =
+    [ ( "memory"
+      , function
+        | "" -> Result.Ok Memory
+        | _ -> Result.Error (`Msg "memory:// scheme accepts no further path") )
+    ; ( "git"
+      , function
+        | "" -> Result.Error (`Msg "git:// expects a path")
+        | p -> Result.ok @@ Git (Path.of_string p) )
+    ]
+
+  let parse s =
+    let f (prefix, extractor) =
+      let open Option.O in
+      let prefix = prefix ^ "://" in
+      let+ s = String.drop_prefix ~prefix s in
+      extractor s
+    in
+    match List.find_map ~f schemes with
+    | None -> Result.Error (`Msg ("unrecognized distribution scheme: " ^ s))
+    | Some v -> v
+
+  let pp fmt = function
+    | Disabled -> ()
+    | Memory -> Format.pp_print_string fmt "memory://"
+    | Git path -> Format.fprintf fmt "git://%s" (Path.to_string path)
+
+  let decode = function
+    | Disabled -> Dune_cache_daemon.Distributed.disabled
+    | Memory -> Dune_cache_daemon.Distributed.irmin
+    | Git path -> Dune_cache_daemon.Distributed.irmin_git path
+
+  let conv = Cmdliner.Arg.conv ~docv:"SCHEME://[ARG]" (parse, pp)
+end
+
 let start =
   let doc = "start daemon"
   and man =
     [ `S "DESCRIPTION"; `P {|Start the daemon if not already running.|} ]
   and term =
-    let+ exit_no_client =
+    let+ distribution =
+      let doc =
+        "URL to a potential distributed artifact repository. Supported schemes \
+         are "
+        ^ String.concat ~sep:", " (List.map ~f:fst Distribution.schemes)
+      in
+      Arg.(
+        value
+        & opt Distribution.conv Disabled
+        & info [ "distribution" ] ~docv:"SCHEME://[ARG]" ~doc)
+    and+ exit_no_client =
       let doc = "Whether to exit once all clients have disconnected" in
       Arg.(
         value & flag
@@ -69,13 +120,13 @@ let start =
         & info ~docv:"PATH" [ "root" ] ~doc:"Root of the dune cache")
     in
     let show_endpoint ep = Printf.printf "%s\n%!" ep
-    and config : Dune_cache_daemon.Daemon.config = { exit_no_client } in
+    and distribution = Distribution.decode distribution in
     let f started =
       let started daemon_info =
         if foreground then show_endpoint daemon_info;
         started ~daemon_info
-      in
-      Dune_cache_daemon.Daemon.daemon ~root ~config started
+      and config : Dune_cache_daemon.Daemon.config = { exit_no_client } in
+      Dune_cache_daemon.Daemon.daemon ~root ~distribution ~config started
     in
     match Daemonize.daemonize ~workdir:root ~foreground port_path f with
     | Result.Ok Finished -> ()

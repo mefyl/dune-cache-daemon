@@ -122,7 +122,7 @@ let log_error context op = function
   | Result.Ok () -> ()
   | Result.Error e -> info [ Pp.textf "%s: %s error: %s" context op e ]
 
-let make ?root ~config () =
+let make ?root ?(distribution = Distributed.disabled) ~config () =
   match
     Cache.Local.make ?root ~duplication_mode:Cache.Duplication_mode.Hardlink
       ~command_handler:(fun _ -> ())
@@ -131,8 +131,8 @@ let make ?root ~config () =
   | Result.Error msg -> Lwt_result.fail (`Local_cache_error msg)
   | Result.Ok cache ->
     let events, event_push = Lwt_stream.create ()
+    and distributed = distribution cache
     and distribution, distribute = Lwt_stream.create ()
-    and distributed = Distributed.irmin_git cache (Path.of_string "/tmp/dune_cache_daemon")
     and distribution_barrier = Barrier.make () in
     let rec distribution_thread () =
       let%lwt () = Barrier.wait distribution_barrier in
@@ -532,11 +532,11 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
 
 let () = Logs.set_reporter (Logs.format_reporter ())
 
-let daemon ~root ~config started =
+let daemon ~root ?distribution ~config started =
   let dune_cache_daemon =
     let open LwtR in
     Path.mkdir_p root;
-    let* daemon = make ~root ~config () in
+    let* daemon = make ~root ?distribution ~config () in
     (* Event blocks signals when waiting. Use a separate thread to catch
        signals. *)
     let signal_handler s =

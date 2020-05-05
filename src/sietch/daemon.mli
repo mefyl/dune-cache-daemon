@@ -12,7 +12,12 @@ type error =
   | `Fatal of string
   ]
 
-val make : ?root:Path.t -> config:config -> unit -> (t, error) Lwt_result.t
+val make :
+     ?root:Path.t
+  -> ?distribution:(Cache.Local.t -> (module Distributed.S))
+  -> config:config
+  -> unit
+  -> (t, error) Lwt_result.t
 
 val default_port_file : unit -> Path.t
 
@@ -29,8 +34,11 @@ val run :
   -> t
   -> unit Lwt.t
 
-(* val stop : t -> unit *)
-
 val endpoint : t -> string option
 
-val daemon : root:Path.t -> config:config -> (string -> unit) -> unit
+val daemon :
+     root:Path.t
+  -> ?distribution:(Cache.Local.t -> (module Distributed.S))
+  -> config:config
+  -> (string -> unit)
+  -> unit

@@ -9,7 +9,7 @@ let ( let* ) = Lwt.Infix.( >>= )
 
 let ( and* ) = Lwt.both
 
-let disabled =
+let disabled _ =
   ( module struct
     type t = unit
 
@@ -379,7 +379,7 @@ module GitFS = struct
     v ?dotgit ?compression ?buffer root
 end
 
-let irmin_git local path =
+let irmin_git path local =
   let module Store =
     Irmin_git.KV (GitFS) (Git_unix.Sync (GitFS)) (Irmin.Contents.String)
   in
