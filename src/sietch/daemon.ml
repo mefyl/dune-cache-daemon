@@ -71,7 +71,12 @@ let check_port_file ?(close = true) p =
 
 let send_sexp output sexp =
   let open LwtR in
-  let* () = CSexp.serialize output sexp in
+  let* () =
+    try%lwt CSexp.serialize output sexp
+    with e ->
+      print_endline "enculay write";
+      raise e
+  in
   try%lwt Lwt_io.flush (CSexp.OStream.to_channel output) |> Lwt.map Result.ok
   with Unix.Unix_error (e, f, _) ->
     Lwt_result.fail
@@ -284,17 +289,22 @@ let client_thread daemon client =
       | SetCommonMetadata metadata ->
         Lwt_result.return { client with common_metadata = metadata }
       | SetRepos repositories ->
-        let* () =
+        let prefetching () =
           let module D = (val daemon.distributed) in
           let f (repository : Cache.repository) =
             D.index_prefetch commits_index_key (Digest.string repository.commit)
           in
           let%lwt results = Lwt_list.map_p f repositories in
-          Result.List.all results
-          |> Result.map ~f:(fun (_ : unit list) -> ())
-          |> Result.map_error ~f:(fun e -> `Distribution_error e)
-          |> Lwt.return
+          match Result.List.all results with
+          | Result.Ok (_ : unit list) -> Lwt.return ()
+          | Result.Error e ->
+            info
+              [ Pp.textf "error while prefetching index %s: %s"
+                  commits_index_key e
+              ];
+            Lwt.return ()
         in
+        let () = Lwt.async prefetching in
         let* client = index_commits daemon client in
         let* cache =
           Cache.Local.with_repositories client.cache repositories
@@ -321,7 +331,13 @@ let client_thread daemon client =
           let* _ = next input in
           (handle [@tailcall]) client
         | _ ->
-          let* cmd = CSexp.parse input in
+          let* cmd =
+            try%lwt CSexp.parse input
+            with e ->
+              print_endline "enculay read";
+              raise e
+          in
+
           debug
             [ Pp.box ~indent:2
               @@ Pp.textf "%s: received command" (peer_name client.peer)
@@ -360,7 +376,7 @@ let client_thread daemon client =
     raise exn
 
 let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
-    ?(trim_size = 10 * 1024 * 1024 * 1024) daemon =
+    ?(trim_size = 10_000_000_000L) daemon =
   let trim_thread max_size period cache =
     let period = float_of_int period in
     let open LwtO in
@@ -370,13 +386,13 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
         match
           let size = Cache.Local.overhead_size cache in
           if size > max_size then (
-            info [ Pp.textf "trimming %i bytes" (size - max_size) ];
-            Some (Cache.Local.trim cache (size - max_size))
+            info [ Pp.textf "trimming %Li bytes" (Int64.sub size max_size) ];
+            Some (Cache.Local.trim cache ~goal:(Int64.sub size max_size))
           ) else
             None
         with
-        | Some { trimmed_files_size = freed; _ } ->
-          info [ Pp.textf "trimming freed %i bytes" freed ]
+        | Some { trimmed_bytes = freed; _ } ->
+          info [ Pp.textf "trimming freed %Li bytes" freed ]
         | None -> debug [ Pp.textf "skip trimming" ]
       in
       trim ()

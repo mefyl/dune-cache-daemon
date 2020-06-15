@@ -50,38 +50,37 @@ module Distribution = struct
     | Disabled
     | Memory
     | Git of Path.t
+    | Webdav of Uri.t
 
-  let schemes =
-    [ ( "memory"
-      , function
-        | "" -> Result.Ok Memory
-        | _ -> Result.Error (`Msg "memory:// scheme accepts no further path") )
-    ; ( "git"
-      , function
-        | "" -> Result.Error (`Msg "git:// expects a path")
-        | p -> Result.ok @@ Git (Path.of_string p) )
-    ]
+  let schemes = [ "git"; "memory"; "webdav"; "webdavs" ]
 
   let parse s =
-    let f (prefix, extractor) =
-      let open Option.O in
-      let prefix = prefix ^ "://" in
-      let+ s = String.drop_prefix ~prefix s in
-      extractor s
-    in
-    match List.find_map ~f schemes with
-    | None -> Result.Error (`Msg ("unrecognized distribution scheme: " ^ s))
-    | Some v -> v
+    let uri = Uri.of_string s in
+    match Uri.scheme uri with
+    | Some "memory" -> Result.Ok Memory
+    | Some "git" -> Result.Ok (Git (Path.of_string (Uri.path uri)))
+    | Some "http"
+    | Some "https" ->
+      Result.Ok (Webdav uri)
+    | Some "webdav" ->
+      Result.Ok (Webdav (Uri.with_uri ~scheme:(Some "http") uri))
+    | Some "webdavs" ->
+      Result.Ok (Webdav (Uri.with_uri ~scheme:(Some "https") uri))
+    | Some scheme ->
+      Result.Error (`Msg ("unrecognized distribution scheme: " ^ scheme))
+    | None -> Result.Error (`Msg "missing distribution scheme")
 
   let pp fmt = function
     | Disabled -> ()
     | Memory -> Format.pp_print_string fmt "memory://"
     | Git path -> Format.fprintf fmt "git://%s" (Path.to_string path)
+    | Webdav uri -> Format.fprintf fmt "%a" Uri.pp uri
 
   let decode = function
     | Disabled -> Dune_cache_daemon.Distributed.disabled
     | Memory -> Dune_cache_daemon.Distributed.irmin
     | Git path -> Dune_cache_daemon.Distributed.irmin_git path
+    | Webdav uri -> Dune_cache_daemon.Webdav.make uri
 
   let conv = Cmdliner.Arg.conv ~docv:"SCHEME://[ARG]" (parse, pp)
 end
@@ -95,7 +94,7 @@ let start =
       let doc =
         "URL to a potential distributed artifact repository. Supported schemes \
          are "
-        ^ String.concat ~sep:", " (List.map ~f:fst Distribution.schemes)
+        ^ String.concat ~sep:", " Distribution.schemes
       in
       Arg.(
         value

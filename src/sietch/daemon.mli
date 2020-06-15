@@ -30,7 +30,7 @@ val run :
      ?port_f:(string -> unit)
   -> ?port:int
   -> ?trim_period:int
-  -> ?trim_size:int
+  -> ?trim_size:int64
   -> t
   -> unit Lwt.t
 

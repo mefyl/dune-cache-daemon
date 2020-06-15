@@ -99,3 +99,39 @@ module Barrier = struct
       open_ b;
       raise e
 end
+
+let mkdir p =
+  try%lwt Lwt_unix.mkdir p 0o700
+  with Unix.Unix_error (Unix.EEXIST, _, _) -> Lwt.return ()
+
+(** Write file in an atomic manner. *)
+let write_file local path executable contents =
+  try%lwt
+    Lwt.map Result.ok
+    @@
+    let dir = path |> Path.parent_exn |> Path.to_string
+    and path_tmp =
+      path |> Path.basename |> Path.relative (Local.tmp local) |> Path.to_string
+    and path = path |> Path.to_string
+    and perm =
+      if executable then
+        0o500
+      else
+        0o400
+    in
+    let%lwt () =
+      let write () =
+        let%lwt output = Lwt_io.open_file ~perm ~mode:Lwt_io.output path_tmp in
+        let%lwt () = Lwt_io.write output contents in
+        Lwt_io.close output
+      in
+      Local.throttle_fd local write
+    and () = mkdir dir in
+    Lwt_unix.rename path_tmp path
+  with
+  | Unix.Unix_error (Unix.EACCES, _, _) ->
+    (* If the file exists with no write permissions, it is being pulled as part
+       of another hinting. *)
+    Lwt_result.return ()
+  | Unix.Unix_error (e, f, a) ->
+    Lwt_result.fail (Printf.sprintf "%s: %s %s" (Unix.error_message e) f a)

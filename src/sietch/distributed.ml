@@ -11,10 +11,6 @@ let ( and* ) = Lwt.both
 
 let disabled _ =
   ( module struct
-    type t = unit
-
-    let v = ()
-
     let distribute _ _ = Lwt_result.return ()
 
     let prefetch _ = Lwt_result.return ()
@@ -61,7 +57,7 @@ let _irmin (type t) cache
       ; store = Lwt_main.run store
       }
 
-    let tmp = Cache.Local.path_tmp cache "dune_cache_daemon"
+    let tmp = Cache.Local.tmp_path cache "dune_cache_daemon"
 
     let find_or_create_tree tree path =
       Store.Tree.find_tree tree path
@@ -142,10 +138,6 @@ let _irmin (type t) cache
         Store.with_tree ~info v.store [] insert |> convert_irmin_error
       in
       Lwt_mutex.with_lock v.insert_mutex distribute
-
-    let mkdir p =
-      try%lwt Lwt_unix.mkdir p 0o700
-      with Unix.Unix_error (Unix.EEXIST, _, _) -> Lwt.return ()
 
     let write_file path (contents, metadata) =
       try%lwt
