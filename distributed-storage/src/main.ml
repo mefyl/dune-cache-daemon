@@ -3,14 +3,22 @@ open Stdune
 
 type t = { root : Path.t }
 
-let ( let* ) = Lwt.Infix.( >>= )
+open Lwt.Infix
+
+let ( let* ) = ( >>= )
 
 exception Bad_request of string
+
+let status_to_string = function
+  | `Code i -> Format.sprintf "%i" i
+  | #Status.standard as status ->
+    Format.sprintf "%s %s" (Status.to_string status)
+      (Status.default_reason_phrase status)
 
 let error reqd status =
   let error reqd status reason =
     let* () =
-      Logs_lwt.info (fun m -> m "> %s %s" (Status.to_string status) reason)
+      Logs_lwt.info (fun m -> m "> %s: %s" (status_to_string status) reason)
     in
     let contents = Format.sprintf "{\"reason\": %S}" reason in
     let headers =
@@ -29,10 +37,11 @@ let bad_request = Format.ksprintf (fun reason -> raise (Bad_request reason))
 module Blocks = struct
   let get { root } reqd hash =
     let f stats input =
+      let file_size = stats.Unix.st_size in
       let response =
         let headers =
           Headers.of_list
-            [ ("Content-length", string_of_int stats.Unix.st_size)
+            [ ("Content-length", string_of_int file_size)
             ; ("Content-type", "application/octet-stream")
             ; ( "X-executable"
               , if stats.st_perm land 0o100 <> 0 then
@@ -48,18 +57,23 @@ module Blocks = struct
       let buffer = Bytes.make size '\x00' in
       let bigstring = Bigstringaf.create size in
       let rec loop () =
-        let* read = Lwt_io.read_into input buffer 0 size in
-        let () =
-          Bigstringaf.unsafe_blit_from_bytes buffer ~src_off:0 bigstring
-            ~dst_off:0 ~len:read
-        in
-        let () = Body.schedule_bigstring body bigstring
-        and wait, resolve = Lwt.wait () in
-        let () = Body.flush body (Lwt.wakeup resolve) in
-        let* () = wait in
-        loop ()
+        Lwt_io.read_into input buffer 0 size >>= function
+        | 0 -> Lwt.return ()
+        | read ->
+          let () =
+            Bigstringaf.unsafe_blit_from_bytes buffer ~src_off:0 bigstring
+              ~dst_off:0 ~len:read
+          in
+          let () = Body.schedule_bigstring body bigstring
+          and wait, resolve = Lwt.wait () in
+          let () = Body.flush body (Lwt.wakeup resolve) in
+          let* () = wait in
+          loop ()
       in
       let* () = loop () in
+      let* () =
+        Logs_lwt.info (fun m -> m "> %s [%i bytes]" (status_to_string `OK) size)
+      in
       Lwt.return @@ Body.close_writer body
     in
     try%lwt
