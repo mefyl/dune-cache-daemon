@@ -96,12 +96,7 @@ let request_handler t sockaddr reqd =
         in
         match meth with
         | `GET -> Blocks.get t reqd hash
-        | _ ->
-          let headers = Headers.of_list [ ("Content-Length", "0") ] in
-          Lwt.return
-          @@ Reqd.respond_with_string reqd
-               (Response.create ~headers `Method_not_allowed)
-               "" )
+        | _ -> error reqd `Method_not_allowed "method not allowed" )
       | path ->
         error reqd `Bad_request "no such endpoint: %S"
           (String.concat ~sep:"/" path)
