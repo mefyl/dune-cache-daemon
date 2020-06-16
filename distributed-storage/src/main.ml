@@ -72,11 +72,19 @@ module Blocks = struct
       error reqd `Not_found "block %S not found locally" (Digest.to_string hash)
 end
 
-let request_handler t _ reqd =
+let string_of_sockaddr = function
+  | Unix.ADDR_UNIX p -> p
+  | Unix.ADDR_INET (addr, port) ->
+    Format.sprintf "%s:%i" (Unix.string_of_inet_addr addr) port
+
+let request_handler t sockaddr reqd =
   let { Request.meth; target; _ } = Reqd.request reqd in
   let respond () =
     let* () =
-      Logs_lwt.info (fun m -> m "%s %s" (Method.to_string meth) target)
+      Logs_lwt.info (fun m ->
+          m "%s: %s %s"
+            (string_of_sockaddr sockaddr)
+            (Method.to_string meth) target)
     in
     try%lwt
       match String.split ~on:'/' target with
