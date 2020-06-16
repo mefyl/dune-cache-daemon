@@ -26,7 +26,53 @@ let error reqd status =
 
 let bad_request = Format.ksprintf (fun reason -> raise (Bad_request reason))
 
-let request_handler { root } _ reqd =
+module Blocks = struct
+  let get { root } reqd hash =
+    let f stats input =
+      let response =
+        let headers =
+          Headers.of_list
+            [ ("Content-length", string_of_int stats.Unix.st_size)
+            ; ("Content-type", "application/octet-stream")
+            ; ( "X-executable"
+              , if stats.st_perm land 0o100 <> 0 then
+                  "1"
+                else
+                  "0" )
+            ]
+        in
+        Response.create ~headers `OK
+      in
+      let body = Reqd.respond_with_streaming reqd response in
+      let size = 4096 in
+      let buffer = Bytes.make size '\x00' in
+      let bigstring = Bigstringaf.create size in
+      let rec loop () =
+        let* read = Lwt_io.read_into input buffer 0 size in
+        let () =
+          Bigstringaf.unsafe_blit_from_bytes buffer ~src_off:0 bigstring
+            ~dst_off:0 ~len:read
+        in
+        let () = Body.schedule_bigstring body bigstring
+        and wait, resolve = Lwt.wait () in
+        let () = Body.flush body (Lwt.wakeup resolve) in
+        let* () = wait in
+        loop ()
+      in
+      let* () = loop () in
+      Lwt.return @@ Body.close_writer body
+    in
+    try%lwt
+      let path = Path.relative root (Digest.to_string hash) in
+      let stats = Path.stat path in
+      Lwt_io.with_file ~mode:Lwt_io.input (Path.to_string path) (f stats)
+    with
+    | Unix.Unix_error (Unix.ENOENT, _, _)
+    | Unix.Unix_error (Unix.EISDIR, _, _) ->
+      error reqd `Not_found "block %S not found locally" (Digest.to_string hash)
+end
+
+let request_handler t _ reqd =
   let { Request.meth; target; _ } = Reqd.request reqd in
   let respond () =
     let* () =
@@ -35,56 +81,13 @@ let request_handler { root } _ reqd =
     try%lwt
       match String.split ~on:'/' target with
       | [ ""; "blocks"; hash ] -> (
+        let hash =
+          match Digest.from_hex hash with
+          | Some hash -> hash
+          | None -> bad_request "invalid hash: %S" hash
+        in
         match meth with
-        | `GET -> (
-          let hash =
-            match Digest.from_hex hash with
-            | Some hash -> hash
-            | None -> bad_request "invalid hash: %S" hash
-          in
-          let f stats input =
-            let response =
-              let headers =
-                Headers.of_list
-                  [ ("Content-length", string_of_int stats.Unix.st_size)
-                  ; ("Content-type", "application/octet-stream")
-                  ; ( "X-executable"
-                    , if stats.st_perm land 0o100 <> 0 then
-                        "1"
-                      else
-                        "0" )
-                  ]
-              in
-              Response.create ~headers `OK
-            in
-            let body = Reqd.respond_with_streaming reqd response in
-            let size = 4096 in
-            let buffer = Bytes.make size '\x00' in
-            let bigstring = Bigstringaf.create size in
-            let rec loop () =
-              let* read = Lwt_io.read_into input buffer 0 size in
-              let () =
-                Bigstringaf.unsafe_blit_from_bytes buffer ~src_off:0 bigstring
-                  ~dst_off:0 ~len:read
-              in
-              let () = Body.schedule_bigstring body bigstring
-              and wait, resolve = Lwt.wait () in
-              let () = Body.flush body (Lwt.wakeup resolve) in
-              let* () = wait in
-              loop ()
-            in
-            let* () = loop () in
-            Lwt.return @@ Body.close_writer body
-          in
-          try%lwt
-            let path = Path.relative root (Digest.to_string hash) in
-            let stats = Path.stat path in
-            Lwt_io.with_file ~mode:Lwt_io.input (Path.to_string path) (f stats)
-          with
-          | Unix.Unix_error (Unix.ENOENT, _, _)
-          | Unix.Unix_error (Unix.EISDIR, _, _) ->
-            error reqd `Not_found "block %S not found locally"
-              (Digest.to_string hash) )
+        | `GET -> Blocks.get t reqd hash
         | _ ->
           let headers = Headers.of_list [ ("Content-Length", "0") ] in
           Lwt.return
