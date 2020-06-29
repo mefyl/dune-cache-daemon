@@ -9,11 +9,19 @@ let ( let* ) = ( >>= )
 
 exception Bad_request of string
 
+exception Method_not_allowed of Httpaf.Method.t
+
 let status_to_string = function
   | `Code i -> Format.sprintf "%i" i
   | #Status.standard as status ->
     Format.sprintf "%s %s" (Status.to_string status)
       (Status.default_reason_phrase status)
+
+let response reqd status =
+  let* () = Logs_lwt.info (fun m -> m "> %s" (status_to_string status)) in
+  let headers = Headers.of_list [ ("Content-length", "0") ] in
+  let response = Response.create ~headers status in
+  Lwt.return @@ Reqd.respond_with_string reqd response ""
 
 let error reqd status =
   let error reqd status reason =
@@ -79,11 +87,77 @@ module Blocks = struct
     try%lwt
       let path = Path.relative root (Digest.to_string hash) in
       let stats = Path.stat path in
-      Lwt_io.with_file ~mode:Lwt_io.input (Path.to_string path) (f stats)
+      Lwt_io.with_file ~flags:[ Unix.O_RDONLY ] ~mode:Lwt_io.input
+        (Path.to_string path) (f stats)
     with
     | Unix.Unix_error (Unix.ENOENT, _, _)
     | Unix.Unix_error (Unix.EISDIR, _, _) ->
       error reqd `Not_found "block %S not found locally" (Digest.to_string hash)
+
+  let put { root } reqd hash executable =
+    let f output =
+      let wait, resolve = Lwt.wait () in
+      let request_body = Reqd.request_body reqd in
+      let size = 1024 in
+      let buffer = Bytes.make size '\x00' in
+      let rec on_read bs ~off ~len =
+        let rec blit blit_from blit_end =
+          if blit_from = blit_end then
+            Lwt.return @@ Body.schedule_read request_body ~on_eof ~on_read
+          else
+            let len = min (blit_end - blit_from) size in
+            let () =
+              Bigstringaf.unsafe_blit_to_bytes bs ~src_off:blit_from buffer
+                ~dst_off:0 ~len
+            in
+            let rec write write_from =
+              if write_from = len then
+                blit (blit_from + len) blit_end
+              else
+                let* written =
+                  Lwt_io.write_from output buffer write_from (len - write_from)
+                in
+                write (write_from + written)
+            in
+            write 0
+        in
+        Lwt.async (fun () -> blit off (off + len))
+      and on_eof () =
+        Lwt.async (fun () ->
+            let* () = response reqd `Created in
+            Lwt.return @@ Lwt.wakeup resolve ())
+      in
+      let () = Body.schedule_read request_body ~on_eof ~on_read in
+      wait
+    in
+    let path = Path.relative root (Digest.to_string hash)
+    and perm =
+      if executable then
+        0o700
+      else
+        0o600
+    in
+    try%lwt
+      Lwt_io.with_file
+        ~flags:[ Unix.O_CREAT; Unix.O_TRUNC; Unix.O_WRONLY ]
+        ~perm ~mode:Lwt_io.output (Path.to_string path) f
+    with
+    | Unix.Unix_error (Unix.ENOENT, _, _) ->
+      error reqd `Not_found "block %S not found locally" (Digest.to_string hash)
+    | Unix.Unix_error (Unix.EISDIR, _, _) ->
+      let* () =
+        Logs_lwt.err (fun m ->
+            m "block file is a directory: %S" (Path.to_string path))
+      in
+      error reqd `Internal_server_error "unable to read block %S"
+        (Digest.to_string hash)
+    | Unix.Unix_error (Unix.EACCES, _, _) ->
+      let* () =
+        Logs_lwt.err (fun m ->
+            m "permission denied on block: %S" (Path.to_string path))
+      in
+      error reqd `Internal_server_error "unable to read block %S"
+        (Digest.to_string hash)
 end
 
 let string_of_sockaddr = function
@@ -92,13 +166,19 @@ let string_of_sockaddr = function
     Format.sprintf "%s:%i" (Unix.string_of_inet_addr addr) port
 
 let request_handler t sockaddr reqd =
-  let { Request.meth; target; _ } = Reqd.request reqd in
+  let { Request.meth; target; Request.headers; _ } = Reqd.request reqd in
   let respond () =
     let* () =
       Logs_lwt.info (fun m ->
           m "%s: %s %s"
             (string_of_sockaddr sockaddr)
             (Method.to_string meth) target)
+    in
+    let meth =
+      match meth with
+      | `GET -> `GET
+      | `PUT -> `PUT
+      | _ -> raise (Method_not_allowed meth)
     in
     try%lwt
       match String.split ~on:'/' target with
@@ -110,11 +190,21 @@ let request_handler t sockaddr reqd =
         in
         match meth with
         | `GET -> Blocks.get t reqd hash
-        | _ -> error reqd `Method_not_allowed "method not allowed" )
+        | `PUT ->
+          let executable = Headers.get headers "X-executable" = Some "1" in
+          Blocks.put t reqd hash executable )
+      | [ ""; "index"; index; hash ] -> (
+        let hash = Digest.string (index ^ hash) in
+        match meth with
+        | `GET -> Blocks.get t reqd hash
+        | `PUT -> Blocks.put t reqd hash false )
       | path ->
         error reqd `Bad_request "no such endpoint: %S"
           (String.concat ~sep:"/" path)
-    with Bad_request reason -> error reqd `Bad_request "%s" reason
+    with
+    | Bad_request reason -> error reqd `Bad_request "%s" reason
+    | Method_not_allowed _ ->
+      error reqd `Method_not_allowed "method not allowed"
   in
   Lwt.async respond
 
@@ -142,6 +232,9 @@ let root =
 let main port root =
   Lwt_main.run
   @@
+  let () =
+    try Unix.mkdir root 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+  in
   let t = { root = Path.of_string root } in
   let request_handler = request_handler t in
   let handler =
