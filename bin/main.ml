@@ -50,9 +50,9 @@ module Distribution = struct
     | Disabled
     | Memory
     | Git of Path.t
-    | Webdav of Uri.t
+    | Dune of Uri.t
 
-  let schemes = [ "git"; "memory"; "webdav"; "webdavs" ]
+  let schemes = [ "git"; "memory"; "http"; "https" ]
 
   let parse s =
     let uri = Uri.of_string s in
@@ -61,11 +61,7 @@ module Distribution = struct
     | Some "git" -> Result.Ok (Git (Path.of_string (Uri.path uri)))
     | Some "http"
     | Some "https" ->
-      Result.Ok (Webdav uri)
-    | Some "webdav" ->
-      Result.Ok (Webdav (Uri.with_uri ~scheme:(Some "http") uri))
-    | Some "webdavs" ->
-      Result.Ok (Webdav (Uri.with_uri ~scheme:(Some "https") uri))
+      Result.Ok (Dune uri)
     | Some scheme ->
       Result.Error (`Msg ("unrecognized distribution scheme: " ^ scheme))
     | None -> Result.Error (`Msg "missing distribution scheme")
@@ -74,13 +70,13 @@ module Distribution = struct
     | Disabled -> ()
     | Memory -> Format.pp_print_string fmt "memory://"
     | Git path -> Format.fprintf fmt "git://%s" (Path.to_string path)
-    | Webdav uri -> Format.fprintf fmt "%a" Uri.pp uri
+    | Dune uri -> Format.fprintf fmt "%a" Uri.pp uri
 
   let decode = function
     | Disabled -> Dune_cache_daemon.Distributed.disabled
     | Memory -> Dune_cache_daemon.Distributed.irmin
     | Git path -> Dune_cache_daemon.Distributed.irmin_git path
-    | Webdav uri -> Dune_cache_daemon.Webdav.make uri
+    | Dune uri -> Dune_cache_daemon.Distributed_dune.make uri
 
   let conv = Cmdliner.Arg.conv ~docv:"SCHEME://[ARG]" (parse, pp)
 end

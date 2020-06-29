@@ -12,17 +12,6 @@ let ( let* ) = Lwt_result.( >>= )
 
 let debug = Dune_util.Log.info
 
-(* let check_status m uri response =
- *   match Cohttp.Response.status response with
- *   | `OK
- *   | `No_content ->
- *     Lwt_result.return ()
- *   | _ ->
- *     let status = Cohttp.Response.status response |> Cohttp.Code.string_of_status
- *     and m = Cohttp.Code.string_of_method m
- *     and uri = Uri.to_string uri in
- *     Lwt_result.fail (Format.sprintf "unexpected %s on %s %s" status m uri) *)
-
 let call t m ?body path =
   let uri = Uri.with_uri ~path:(Option.some @@ Uri.path t.uri ^ path) t.uri
   and headers =
@@ -36,7 +25,6 @@ let call t m ?body path =
         (Printf.sprintf "error during HTTP request %s: %s %s"
            (Unix.error_message e) f a)
   in
-
   let* body = Cohttp_lwt.Body.to_string body |> Lwt.map Result.ok in
   Lwt_result.return (Cohttp.Response.status response, body)
 
@@ -52,7 +40,7 @@ let expect_status expected m path = function
 let put_contents t path contents =
   let body = Lwt_stream.of_list [ contents ] |> Cohttp_lwt.Body.of_stream in
   let* status, _body = call t `PUT ~body path in
-  Lwt.return @@ expect_status [ `Created; `No_content ] `PUT path status
+  Lwt.return @@ expect_status [ `Created; `OK ] `PUT path status
 
 let get_file t path local_path =
   if Path.exists local_path then
@@ -82,7 +70,7 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
           in
           Lwt_stream.from read |> Cohttp_lwt.Body.of_stream
         in
-        let path = "files/v3/" ^ Digest.to_string digest in
+        let path = "blocks/" ^ Digest.to_string digest in
         let* status, _body = call t `PUT ~body path in
         Lwt.return @@ expect_status [ `Created; `No_content ] `PUT path status
       in
@@ -91,7 +79,7 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
     let%lwt results = Lwt.all @@ List.map ~f:insert_file metadata.files in
     let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
     put_contents t
-      ("meta/v3/" ^ Digest.to_string key)
+      ("blocks/" ^ Digest.to_string key)
       (Cache.Local.Metadata_file.to_string metadata)
   with _ -> failwith "distribute fatal error"
 
@@ -105,13 +93,13 @@ let prefetch ({ cache; _ } as t) key =
         ]
       |> Lwt_result.return
     else
-      let path = "meta/v3/" ^ Digest.to_string key in
+      let path = "blocks/" ^ Digest.to_string key in
       let* status, body = call t `GET path in
       let* () = expect_status [ `OK ] `GET path status |> Lwt.return in
       let* metadata = Cache.Local.Metadata_file.of_string body |> Lwt.return in
       let fetch { Cache.File.digest; _ } =
         get_file t
-          ("files/v3/" ^ Digest.to_string digest)
+          ("blocks/" ^ Digest.to_string digest)
           (Local.file_path cache digest)
       in
       let%lwt results = Lwt.all @@ List.map ~f:fetch metadata.files in
