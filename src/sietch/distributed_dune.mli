@@ -4,7 +4,7 @@ module Config : sig
   type t = { nodes : node list }
 
   and node =
-    { hostname : string
+    { hostname : Uri.t
     ; space : range list
     }
 
@@ -13,4 +13,4 @@ module Config : sig
   val of_file : Path.t -> (t, string) Result.t
 end
 
-val make : Uri.t -> Cache.Local.t -> (module Distributed.S)
+val make : Config.t -> Cache.Local.t -> (module Distributed.S)

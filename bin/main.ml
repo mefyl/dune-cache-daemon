@@ -50,9 +50,10 @@ module Distribution = struct
     | Disabled
     | Memory
     | Git of Path.t
-    | Dune of Uri.t
+    | Dune_endpoint of Uri.t
+    | Dune_config of Path.t
 
-  let schemes = [ "git"; "memory"; "http"; "https" ]
+  let schemes = [ "git"; "memory"; "http"; "https"; "" ]
 
   let parse s =
     let uri = Uri.of_string s in
@@ -61,24 +62,37 @@ module Distribution = struct
     | Some "git" -> Result.Ok (Git (Path.of_string (Uri.path uri)))
     | Some "http"
     | Some "https" ->
-      Result.Ok (Dune uri)
+      Result.Ok (Dune_endpoint uri)
+    | None -> Result.Ok (Dune_config (Path.of_string s))
     | Some scheme ->
       Result.Error (`Msg ("unrecognized distribution scheme: " ^ scheme))
-    | None -> Result.Error (`Msg "missing distribution scheme")
 
   let pp fmt = function
     | Disabled -> ()
     | Memory -> Format.pp_print_string fmt "memory://"
     | Git path -> Format.fprintf fmt "git://%s" (Path.to_string path)
-    | Dune uri -> Format.fprintf fmt "%a" Uri.pp uri
+    | Dune_endpoint uri -> Uri.pp fmt uri
+    | Dune_config path -> Format.pp_print_string fmt (Path.to_string path)
 
   let decode = function
-    | Disabled -> Dune_cache_daemon.Distributed.disabled
-    | Memory -> Dune_cache_daemon.Distributed.irmin
-    | Git path -> Dune_cache_daemon.Distributed.irmin_git path
-    | Dune uri -> Dune_cache_daemon.Distributed_dune.make uri
+    | Disabled -> Dune_cache_daemon.Distributed.disabled |> Result.return
+    | Memory -> Dune_cache_daemon.Distributed.irmin |> Result.return
+    | Git path -> Dune_cache_daemon.Distributed.irmin_git path |> Result.return
+    | Dune_endpoint uri ->
+      let min =
+        Digest.from_hex "00000000000000000000000000000000" |> Option.value_exn
+      and max =
+        Digest.from_hex "ffffffffffffffffffffffffffffffff" |> Option.value_exn
+      in
+      Dune_cache_daemon.Distributed_dune.make
+        { nodes = [ { hostname = uri; space = [ (min, max) ] } ] }
+      |> Result.return
+    | Dune_config path ->
+      let ( let* ) v f = Result.bind v ~f in
+      let* config = Dune_cache_daemon.Distributed_dune.Config.of_file path in
+      Dune_cache_daemon.Distributed_dune.make config |> Result.return
 
-  let conv = Cmdliner.Arg.conv ~docv:"SCHEME://[ARG]" (parse, pp)
+  let conv = Cmdliner.Arg.conv ~docv:"URL" (parse, pp)
 end
 
 let start =
@@ -115,7 +129,11 @@ let start =
         & info ~docv:"PATH" [ "root" ] ~doc:"Root of the dune cache")
     in
     let show_endpoint ep = Printf.printf "%s\n%!" ep
-    and distribution = Distribution.decode distribution in
+    and distribution =
+      match Distribution.decode distribution with
+      | Result.Ok distribution -> distribution
+      | Result.Error e -> User_error.raise [ Pp.text e ]
+    in
     let f started =
       let started daemon_info =
         if foreground then show_endpoint daemon_info;

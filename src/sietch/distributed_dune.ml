@@ -2,18 +2,13 @@ open Stdune
 open Utils
 module Sexp = Sexplib.Sexp
 
-type t =
-  { cache : Local.t
-  ; uri : Uri.t
-  }
-
 let ( let* ) = Lwt_result.( >>= )
 
 module Config = struct
   type t = { nodes : node list }
 
   and node =
-    { hostname : string
+    { hostname : Uri.t
     ; space : range list
     }
 
@@ -30,7 +25,7 @@ module Config = struct
       let f (hostname, ranges) = function
         | Sexp.List [ Sexp.Atom "hostname"; Sexp.Atom h ] -> (
           match hostname with
-          | None -> Result.return (Some h, ranges)
+          | None -> Result.return (Some (Uri.of_string h), ranges)
           | Some _ -> Result.Error ("duplicate hostname statement: " ^ h) )
         | Sexp.List [ Sexp.Atom "range"; Sexp.Atom start; Sexp.Atom end_ ] -> (
           let* start = parse_address start '0' in
@@ -81,12 +76,33 @@ module Config = struct
     | [] -> Result.Error "empty configuration file"
 end
 
-let make cache uri = { cache; uri }
+type t =
+  { cache : Local.t
+  ; config : Config.t
+  }
+
+let make cache config = { cache; config }
 
 let debug = Dune_util.Log.info
 
-let call t m ?body path =
-  let uri = Uri.with_uri ~path:(Option.some @@ Uri.path t.uri ^ path) t.uri
+let find_target t target =
+  let f node =
+    let f (start, end_) =
+      Digest.compare start target <> Ordering.Gt
+      && Digest.compare target end_ <> Ordering.Gt
+    in
+    Option.is_some @@ List.find ~f node.Config.space
+  in
+  match List.find t.config.nodes ~f with
+  | Some t -> Result.return t.hostname
+  | None ->
+    Result.Error
+      (Printf.sprintf "no target backend for address %s"
+         (Digest.to_string target))
+
+let call t target m ?body path =
+  let* uri = find_target t target |> Lwt.return in
+  let uri = Uri.with_uri ~path:(Option.some @@ Uri.path uri ^ path) uri
   and headers =
     Cohttp.Header.of_list [ ("Content-Type", "application/octet-stream") ]
   in
@@ -110,12 +126,12 @@ let expect_status expected m path = function
          (Cohttp.Code.string_of_method m)
          path)
 
-let put_contents t path contents =
+let put_contents t target path contents =
   let body = Lwt_stream.of_list [ contents ] |> Cohttp_lwt.Body.of_stream in
-  let* status, _body = call t `PUT ~body path in
+  let* status, _body = call t target `PUT ~body path in
   Lwt.return @@ expect_status [ `Created; `OK ] `PUT path status
 
-let get_file t path local_path =
+let get_file t target path local_path =
   if Path.exists local_path then
     debug
       [ Pp.textf "metadata file already present locally: %s"
@@ -123,7 +139,7 @@ let get_file t path local_path =
       ]
     |> Lwt_result.return
   else
-    let* status, body = call t `GET path in
+    let* status, body = call t target `GET path in
     let* () = expect_status [ `OK ] `GET path status |> Lwt.return in
     write_file t.cache local_path true body
 
@@ -144,14 +160,14 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
           Lwt_stream.from read |> Cohttp_lwt.Body.of_stream
         in
         let path = "blocks/" ^ Digest.to_string digest in
-        let* status, _body = call t `PUT ~body path in
+        let* status, _body = call t digest `PUT ~body path in
         Lwt.return @@ expect_status [ `Created; `No_content ] `PUT path status
       in
       Lwt_io.with_file ~mode:Lwt_io.input (Path.to_string path) insert
     in
     let%lwt results = Lwt.all @@ List.map ~f:insert_file metadata.files in
     let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
-    put_contents t
+    put_contents t key
       ("blocks/" ^ Digest.to_string key)
       (Cache.Local.Metadata_file.to_string metadata)
   with e -> failwith ("distribute fatal error: " ^ Printexc.to_string e)
@@ -167,11 +183,11 @@ let prefetch ({ cache; _ } as t) key =
       |> Lwt_result.return
     else
       let path = "blocks/" ^ Digest.to_string key in
-      let* status, body = call t `GET path in
+      let* status, body = call t key `GET path in
       let* () = expect_status [ `OK ] `GET path status |> Lwt.return in
       let* metadata = Cache.Local.Metadata_file.of_string body |> Lwt.return in
       let fetch { Cache.File.digest; _ } =
-        get_file t
+        get_file t digest
           ("blocks/" ^ Digest.to_string digest)
           (Local.file_path cache digest)
       in
@@ -185,14 +201,14 @@ let index_path name key =
 
 let index_add t name key keys =
   try%lwt
-    put_contents t (index_path name key)
+    put_contents t key (index_path name key)
       (String.concat ~sep:"\n" (List.map ~f:Digest.to_string keys))
   with e -> failwith ("index_add fatal error: " ^ Printexc.to_string e)
 
 let index_prefetch t name key =
   try%lwt
     let path = index_path name key in
-    let* status, body = call t `GET path in
+    let* status, body = call t key `GET path in
     let* () =
       expect_status [ `OK; `Not_found ] `GET path status |> Lwt.return
     in
@@ -208,11 +224,11 @@ let index_prefetch t name key =
       Lwt_result.return ()
   with e -> failwith ("index_prefetech fatal error: " ^ Printexc.to_string e)
 
-let make uri local =
+let make config local =
   ( module struct
     let v =
       let local = Local.make local in
-      make local uri
+      make local config
 
     let distribute = distribute v
 
