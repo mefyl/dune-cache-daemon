@@ -81,7 +81,7 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
     put_contents t
       ("blocks/" ^ Digest.to_string key)
       (Cache.Local.Metadata_file.to_string metadata)
-  with _ -> failwith "distribute fatal error"
+  with e -> failwith ("distribute fatal error: " ^ Printexc.to_string e)
 
 let prefetch ({ cache; _ } as t) key =
   try%lwt
@@ -105,7 +105,7 @@ let prefetch ({ cache; _ } as t) key =
       let%lwt results = Lwt.all @@ List.map ~f:fetch metadata.files in
       let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
       write_file cache local_path false body
-  with _ -> failwith "prefetch fatal error"
+  with e -> failwith ("prefetch fatal error: " ^ Printexc.to_string e)
 
 let index_path name key =
   String.concat ~sep:"/" [ "index"; name; Digest.to_string key ]
@@ -114,7 +114,7 @@ let index_add t name key keys =
   try%lwt
     put_contents t (index_path name key)
       (String.concat ~sep:"\n" (List.map ~f:Digest.to_string keys))
-  with _ -> failwith "index_add fatal error"
+  with e -> failwith ("index_add fatal error: " ^ Printexc.to_string e)
 
 let index_prefetch t name key =
   try%lwt
@@ -133,7 +133,7 @@ let index_prefetch t name key =
       Lwt_result.return ()
     else
       Lwt_result.return ()
-  with _ -> failwith "index_prefetch fatal error"
+  with e -> failwith ("index_prefetech fatal error: " ^ Printexc.to_string e)
 
 let make uri local =
   ( module struct
