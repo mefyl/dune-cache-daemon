@@ -2,6 +2,8 @@
 
 (name dune-cache-daemon)
 
+(version 0.1.0)
+
 (generate_opam_files true)
 
 (license MIT)
@@ -17,9 +19,17 @@
 
 (package
  (name dune-cache-daemon)
- ; The "depends" and "build" field are written in dune.opam.template
+ (synopsis "Dune distributed cache daemon")
  (depends
   (dune-private-libs
-   (= 2.4.0))
-  (logs
-   (>= 0.7.0))))
+   (>= 2.4.0))
+  cmdliner
+  git-unix
+  httpaf
+  httpaf-lwt-unix
+  irmin
+  irmin-git
+  irmin-mem
+  logs
+  lwt
+  lwt_ppx))
