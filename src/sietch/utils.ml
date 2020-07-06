@@ -1,4 +1,67 @@
+module Csexp_external = Csexp
 open Stdune
+
+module Csexp = struct
+  include Csexp_external.Make (Sexp)
+
+  module Lwt = struct
+    module Input = struct
+      type t =
+        { channel : Lwt_io.input_channel
+        ; mutable peeked : char option
+        }
+
+      let make channel = { channel; peeked = None }
+
+      module Monad = Lwt
+
+      let ( let* ) = Lwt_result.Infix.( >>= )
+
+      let rec _read_string t count =
+        match t.peeked with
+        | Some c ->
+          t.peeked <- None;
+          let* s = _read_string t (count - 1) in
+          Lwt_result.return @@ String.make 1 c ^ s
+        | None -> (
+          try%lwt Lwt_io.read ~count t.channel |> Lwt.map Result.return
+          with e -> Lwt_result.fail (Printexc.to_string e) )
+
+      let read_string t count =
+        let* res = _read_string t count in
+        if String.length res = count then
+          Lwt_result.return res
+        else
+          Lwt_result.fail "premature end of input"
+
+      let read_char t =
+        match t.peeked with
+        | Some c ->
+          t.peeked <- None;
+          Lwt_result.return c
+        | None ->
+          let* s = read_string t 1 in
+          Lwt_result.return s.[0]
+
+      let peek_char t =
+        match t.peeked with
+        | Some c -> Lwt_result.return (Some c)
+        | None ->
+          let* s = _read_string t 1 in
+          if String.length s = 0 then
+            Lwt_result.return None
+          else
+            Lwt_result.return (Some s.[0])
+    end
+
+    module Parser = struct
+      include Make_parser (Input)
+
+      let parse input =
+        parse input |> Lwt_result.map_err (fun e -> `Parse_error e)
+    end
+  end
+end
 
 let int_of_string ?where s =
   match Int.of_string s with

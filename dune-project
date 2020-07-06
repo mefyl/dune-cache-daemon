@@ -23,6 +23,8 @@
  (depends
   (dune-private-libs
    (>= 2.4.0))
+  (csexp
+   (= 1.2.3))
   cmdliner
   git-unix
   httpaf

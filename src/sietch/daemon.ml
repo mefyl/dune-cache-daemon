@@ -1,13 +1,11 @@
 module Evt = Event
 module Utils = Utils
 module Log = Dune_util.Log
-module Csexp_dune_cache_daemon = Csexp
 open Stdune
 open Utils
 open Cache.Messages
 open Result.O
 open Pp.O
-module CSexp = Csexp_dune_cache_daemon.Lwt
 
 type error =
   [ `Local_cache_error of string
@@ -23,8 +21,8 @@ type client =
   ; commits : Digest.t list array
   ; common_metadata : Sexp.t list
   ; fd : Lwt_unix.file_descr
-  ; input : CSexp.IStream.t
-  ; output : CSexp.OStream.t
+  ; input : Csexp.Lwt.Input.t
+  ; output : Lwt_io.output_channel
   ; peer : Unix.sockaddr
   ; repositories : Cache.repository list
   ; version : version
@@ -72,12 +70,9 @@ let check_port_file ?(close = true) p =
 let send_sexp output sexp =
   let open LwtR in
   let* () =
-    try%lwt CSexp.serialize output sexp
-    with e ->
-      print_endline "enculay write";
-      raise e
+    Lwt_io.write output @@ Csexp.to_string sexp |> Lwt.map Result.return
   in
-  try%lwt Lwt_io.flush (CSexp.OStream.to_channel output) |> Lwt.map Result.ok
+  try%lwt Lwt_io.flush output |> Lwt.map Result.return
   with Unix.Unix_error (e, f, _) ->
     Lwt_result.fail
       (`Write_error (Printf.sprintf "%s: %s" (Unix.error_message e) f))
@@ -263,6 +258,7 @@ let client_thread daemon client =
         in
         Lwt.async prefetching;
         Lwt_result.return client
+      | Promoted _ -> failwith "FIXME"
       | Promote { duplication; repository; files; key; metadata } ->
         let metadata = metadata @ client.common_metadata in
         let* () =
@@ -318,26 +314,23 @@ let client_thread daemon client =
     let f () =
       let rec handle client =
         let open Lwt_result.Infix in
-        let open CSexp.IStream in
+        let open Csexp.Lwt.Input in
         let open LwtR in
         debug [ Pp.textf "%s: read next command" (peer_name client.peer) ];
-        peek input >>= function
+        peek_char input |> Lwt_result.map_err (fun e -> `Read_error e)
+        >>= function
         | None ->
           debug [ Pp.textf "%s: ended" (peer_name client.peer) ];
           let* client = index_commits daemon client in
           Lwt_result.return client
         | Some '\n' ->
           (* Skip toplevel newlines, for easy netcat interaction *)
-          let* _ = next input in
+          let* _ =
+            read_char input |> Lwt_result.map_err (fun e -> `Read_error e)
+          in
           (handle [@tailcall]) client
         | _ ->
-          let* cmd =
-            try%lwt CSexp.parse input
-            with e ->
-              print_endline "enculay read";
-              raise e
-          in
-
+          let* cmd = Csexp.Lwt.Parser.parse input in
           debug
             [ Pp.box ~indent:2
               @@ Pp.textf "%s: received command" (peer_name client.peer)
@@ -447,8 +440,8 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
     | Some Stop ->
       stop ()
     | Some (New_client (fd, peer)) ->
-      let input = Lwt_io.of_fd ~mode:Lwt_io.input fd |> CSexp.IStream.make
-      and output = Lwt_io.of_fd ~mode:Lwt_io.output fd |> CSexp.OStream.make in
+      let input = Lwt_io.of_fd ~mode:Lwt_io.input fd |> Csexp.Lwt.Input.make
+      and output = Lwt_io.of_fd ~mode:Lwt_io.output fd in
       let* res =
         info [ Pp.textf "accept new client %s" (peer_name peer) ];
         let open LwtR in
@@ -457,10 +450,11 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
             Lang my_versions
             |> Cache.Messages.sexp_of_message { major = 1; minor = 0 }
           in
-          CSexp.serialize output version_message
+          Lwt_io.write output (Csexp.to_string version_message)
+          |> Lwt.map Result.return
         in
         let* their_versions =
-          let* msg = CSexp.parse input in
+          let* msg = Csexp.Lwt.Parser.parse input in
           initial_message_of_sexp msg
           |> Result.map ~f:(fun (Lang res) -> res)
           |> Result.map_error ~f:(fun e -> `Protocol_error e)
