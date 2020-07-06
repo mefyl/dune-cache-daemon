@@ -48,8 +48,10 @@ module Config = struct
   let of_file path =
     let ( let* ) v f = Result.bind v ~f in
     let* sexp =
-      try Result.return @@ Sexp.load_sexps @@ Path.to_string path
-      with e -> Result.Error ("sexp parse error: " ^ Printexc.to_string e)
+      try Result.return @@ Sexp.load_sexps @@ Path.to_string path with
+      | Sys_error e ->
+        Result.Error (Printf.sprintf "unable to load configuration: %s" e)
+      | e -> Result.Error ("sexp parse error: " ^ Printexc.to_string e)
     in
     match sexp with
     | Sexp.List

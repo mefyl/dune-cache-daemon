@@ -63,7 +63,8 @@ module Distribution = struct
     | Some "http"
     | Some "https" ->
       Result.Ok (Dune_endpoint uri)
-    | None -> Result.Ok (Dune_config (Path.of_string s))
+    | None ->
+      Result.Ok (Dune_config (Path.of_filename_relative_to_initial_cwd s))
     | Some scheme ->
       Result.Error (`Msg ("unrecognized distribution scheme: " ^ scheme))
 
