@@ -51,7 +51,9 @@ module Csexp = struct
           if String.length s = 0 then
             Lwt_result.return None
           else
-            Lwt_result.return (Some s.[0])
+            let c = Some s.[0] in
+            t.peeked <- c;
+            Lwt_result.return c
     end
 
     module Parser = struct
