@@ -17,6 +17,9 @@ module Csexp = struct
 
       let ( let* ) = Lwt_result.Infix.( >>= )
 
+      (* Not exactly efficient memory-wise, but we're dealing with small
+         buffers. *)
+
       let rec _read_string t count =
         match t.peeked with
         | Some c ->
@@ -27,12 +30,14 @@ module Csexp = struct
           try%lwt Lwt_io.read ~count t.channel |> Lwt.map Result.return
           with e -> Lwt_result.fail (Printexc.to_string e) )
 
-      let read_string t count =
+      let rec read_string t count =
         let* res = _read_string t count in
-        if String.length res = count then
-          Lwt_result.return res
-        else
-          Lwt_result.fail "premature end of input"
+        match String.length res with
+        | l when l = count -> Lwt_result.return res
+        | 0 -> Lwt_result.fail "premature end of input"
+        | l ->
+          let* rest = read_string t (count - l) in
+          Lwt_result.return (res ^ rest)
 
       let read_char t =
         match t.peeked with
