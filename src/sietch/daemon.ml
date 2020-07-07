@@ -246,6 +246,13 @@ let client_thread daemon client =
     let handle_cmd (client : client) sexp () =
       let open LwtR in
       let* msg = outgoing_message_of_sexp client.version sexp |> Lwt.return in
+      let promoted metadata { repository; key; _ } =
+        let () = daemon.distribute (Some (key, metadata)) in
+        let register_commit repository =
+          client.commits.(repository) <- key :: client.commits.(repository)
+        in
+        Option.iter ~f:register_commit repository
+      in
       match msg with
       | Hint keys ->
         let open LwtO in
@@ -258,22 +265,30 @@ let client_thread daemon client =
         in
         Lwt.async prefetching;
         Lwt_result.return client
-      | Promoted _ -> failwith "FIXME"
-      | Promote { duplication; repository; files; key; metadata } ->
+      | Promote ({ duplication; repository; files; key; metadata } as promotion)
+        ->
         let metadata = metadata @ client.common_metadata in
-        let* () =
-          let* metadata, _ =
-            Cache.Local.promote_sync client.cache files key metadata ~repository
-              ~duplication
-            |> Result.map_error ~f:(fun e -> `Distribution_error e)
+        let* metadata, _ =
+          Cache.Local.promote_sync client.cache files key metadata ~repository
+            ~duplication
+          |> Result.map_error ~f:(fun e -> `Distribution_error e)
+          |> Lwt.return
+        in
+        let () = promoted metadata promotion in
+        Lwt_result.return client
+      | Promoted ({ key; _ } as promotion) ->
+        let* metadata =
+          let* sexp =
+            Cache.Local.metadata_path client.cache key
+            |> Io.read_file |> Csexp.parse_string
+            |> Result.map_error ~f:(fun (_, e) -> `Parse_error e)
             |> Lwt.return
           in
-          let () = daemon.distribute (Some (key, metadata)) in
-          let register_commit repository =
-            client.commits.(repository) <- key :: client.commits.(repository)
-          in
-          Option.iter ~f:register_commit repository |> Lwt_result.return
+          Cache.Local.Metadata_file.of_sexp sexp
+          |> Result.map_error ~f:(fun e -> `Parse_error e)
+          |> Lwt.return
         in
+        let () = promoted metadata promotion in
         Lwt_result.return client
       | SetBuildRoot root ->
         let res =
