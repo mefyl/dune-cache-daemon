@@ -19,16 +19,16 @@ val make :
   -> unit
   -> (t, error) Lwt_result.t
 
-val default_port_file : unit -> Path.t
+val default_endpoint_file : unit -> Path.t
 
-val check_port_file :
+val check_endpoint_file :
      ?close:bool
   -> Path.t
   -> ((string * int * Unix.file_descr) option, exn) Result.t
 
 val run :
-     ?port_f:(string -> unit)
-  -> ?port:int
+     ?endpoint_f:(string -> unit)
+  -> ?endpoint:Unix.sockaddr
   -> ?trim_period:int
   -> ?trim_size:int64
   -> t

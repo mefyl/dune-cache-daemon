@@ -38,12 +38,12 @@ let path_conv =
   in
   ((fun s -> `Ok (Path.of_string s)), pp)
 
-let port_path =
+let endpoint_path =
   Arg.(
     value
-    & opt path_conv (Dune_cache_daemon.Daemon.default_port_file ())
-    & info ~docv:"PATH" [ "port-file" ]
-        ~doc:"The file to read/write the daemon port to/from.")
+    & opt path_conv (Dune_cache_daemon.Daemon.default_endpoint_file ())
+    & info ~docv:"PATH" [ "endpoint-file" ]
+        ~doc:"The file to read/write the daemon endpoint to/from.")
 
 module Distribution = struct
   type t =
@@ -122,7 +122,7 @@ let start =
         value & flag
         & info [ "foreground"; "f" ]
             ~doc:"Whether to start in the foreground or as a daeon")
-    and+ port_path = port_path
+    and+ endpoint_path = endpoint_path
     and+ root =
       Arg.(
         value
@@ -142,7 +142,7 @@ let start =
       and config : Dune_cache_daemon.Daemon.config = { exit_no_client } in
       Dune_cache_daemon.Daemon.daemon ~root ~distribution ~config started
     in
-    match Daemonize.daemonize ~workdir:root ~foreground port_path f with
+    match Daemonize.daemonize ~workdir:root ~foreground endpoint_path f with
     | Result.Ok Finished -> ()
     | Result.Ok (Daemonize.Started { daemon_info = endpoint; _ }) ->
       show_endpoint endpoint
@@ -160,8 +160,8 @@ let stop =
   let doc = "stop daemon"
   and man = [ `S "DESCRIPTION"; `P {|Stop the daemon.|} ]
   and term =
-    let+ port_path = port_path in
-    match Daemonize.stop port_path with
+    let+ endpoint_path = endpoint_path in
+    match Daemonize.stop endpoint_path with
     | Error s -> User_error.raise [ Pp.text s ]
     | Ok () -> ()
   in

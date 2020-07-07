@@ -32,7 +32,7 @@ let info = Log.info
 
 let debug = ignore
 
-let default_port_file () =
+let default_runtime_file name =
   let runtime_dir =
     match Sys.getenv_opt "XDG_RUNTIME_DIR" with
     | Some p -> Path.relative (Path.of_string p) "dune-cache-daemon"
@@ -44,11 +44,13 @@ let default_port_file () =
          difference. *)
       Path.relative (Cache.Local.default_root ()) "runtime"
   in
-  Path.L.relative runtime_dir [ "dune-cache-daemon"; "port" ]
+  Path.L.relative runtime_dir [ "dune-cache-daemon"; name ]
 
-let max_port_size = 1024
+let default_endpoint_file () = default_runtime_file "endpoint"
 
-let check_port_file ?(close = true) p =
+let max_endpoint_size = 1024
+
+let check_endpoint_file ?(close = true) p =
   let p = Path.to_string p in
   match Result.try_with (fun () -> Unix.openfile p [ Unix.O_RDONLY ] 0o600) with
   | Result.Ok fd ->
@@ -59,8 +61,8 @@ let check_port_file ?(close = true) p =
           | Some (Fcntl.Read, pid) -> Some (Some pid)
           | Some (Fcntl.Write, _) -> None)
       >>| Option.map ~f:(fun pid ->
-              let buf = Bytes.make max_port_size ' ' in
-              let read = Unix.read fd buf 0 max_port_size in
+              let buf = Bytes.make max_endpoint_size ' ' in
+              let read = Unix.read fd buf 0 max_endpoint_size in
               (Bytes.sub_string buf ~pos:0 ~len:read, pid, fd))
     and finally () = if close then Unix.close fd in
     Exn.protect ~f ~finally
@@ -103,7 +105,7 @@ type t =
   { root : Path.t
   ; mutable socket : fd option
   ; mutable clients : (client * unit Lwt.t) Clients.t
-  ; mutable endpoint : string option
+  ; mutable endpoint : Uri.t option
   ; mutable accept_thread : unit Lwt.t option
   ; mutable trim_thread : unit Lwt.t option
   ; config : config
@@ -172,18 +174,15 @@ let make ?root ?(distribution = Distributed.disabled) ~config () =
       }
 
 let getsockname = function
-  | Unix.ADDR_UNIX _ ->
-    User_error.raise
-      [ Pp.textf "got a Unix socket connection on our TCP socket ?" ]
-  | Unix.ADDR_INET (addr, port) -> (addr, port)
+  | Unix.ADDR_UNIX path -> Uri.make ~scheme:"unix" ~path ()
+  | Unix.ADDR_INET (addr, port) ->
+    Uri.make ~scheme:"tcp" ~host:(Unix.string_of_inet_addr addr) ~port ()
 
-let peer_name s =
-  let addr, port = getsockname s in
-  Printf.sprintf "%s:%d" (Unix.string_of_inet_addr addr) port
+let peer_name s = getsockname s |> Uri.to_string
 
 let my_versions : version list = [ { major = 1; minor = 2 } ]
 
-let endpoint m = m.endpoint
+let endpoint m = m.endpoint |> Option.map ~f:Uri.to_string
 
 let client_handle peer version output = function
   | Cache.Dedup f ->
@@ -383,7 +382,7 @@ let client_thread daemon client =
       ];
     raise exn
 
-let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
+let run ?(endpoint_f = ignore) ?endpoint ?(trim_period = 10 * 60)
     ?(trim_size = 10_000_000_000L) daemon =
   let trim_thread max_size period cache =
     let period = float_of_int period in
@@ -417,17 +416,27 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
     daemon.event_push (Some (New_client (fd, peer)));
     (accept_thread [@tailcall]) sock
   in
-  let sock = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  daemon.socket <- Some sock;
   let open LwtO in
-  let* () =
-    Lwt_unix.bind sock
-      (Unix.ADDR_INET (Unix.inet_addr_of_string "127.0.0.1", port))
+  let endpoint =
+    Option.value
+      ~default:
+        (Unix.ADDR_UNIX (default_runtime_file "socket" |> Path.to_string))
+      endpoint
   in
-  let addr, port = getsockname (Lwt_unix.getsockname sock) in
-  let endpoint = Printf.sprintf "%s:%i" (Unix.string_of_inet_addr addr) port in
+  let sock =
+    match endpoint with
+    | Unix.ADDR_UNIX path ->
+      let () =
+        try Unix.unlink path with Unix.Unix_error (Unix.ENOENT, _, _) -> ()
+      in
+      Lwt_unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0
+    | Unix.ADDR_INET _ -> Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0
+  in
+  let () = daemon.socket <- Some sock in
+  let* () = Lwt_unix.bind sock endpoint in
+  let endpoint = getsockname (Lwt_unix.getsockname sock) in
   daemon.endpoint <- Some endpoint;
-  port_f endpoint;
+  endpoint_f (Uri.to_string endpoint);
   Lwt_unix.listen sock 1024;
   daemon.accept_thread <- Some (accept_thread sock);
   daemon.trim_thread <- Some (trim_thread trim_size trim_period daemon.cache);
@@ -436,7 +445,8 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
       info [ Pp.textf "stop" ];
       let+ () =
         match daemon.socket with
-        | Some fd ->
+        | Some fd -> (
+          let sockname = Lwt_unix.getsockname fd in
           daemon.socket <- None;
           let clean f = Lwt_list.iter_p f (Clients.to_list daemon.clients) in
           let* () =
@@ -445,7 +455,12 @@ let run ?(port_f = ignore) ?(port = 0) ?(trim_period = 10 * 60)
           in
           let* () = clean (fun (_, (_, thread)) -> thread) in
           let* () = clean (fun (fd, _) -> Lwt_unix.close fd) in
-          Lwt_unix.close fd
+          let* () = Lwt_unix.close fd in
+          match sockname with
+          | Unix.ADDR_UNIX path -> (
+            try Lwt.return @@ Unix.unlink path
+            with Unix.Unix_error (Unix.ENOENT, _, _) -> Lwt.return () )
+          | _ -> Lwt.return () )
         | None -> Lwt.return ()
       in
       Cache.Local.teardown daemon.cache
@@ -572,7 +587,7 @@ let daemon ~root ?distribution ~config started =
       let f s = Lwt_unix.on_signal s signal_handler in
       List.map ~f signals
     in
-    let ran = run ~port_f:started daemon in
+    let ran = run ~endpoint_f:started daemon in
     Lwt.map Result.ok ran
   in
   match Lwt_main.run dune_cache_daemon with
