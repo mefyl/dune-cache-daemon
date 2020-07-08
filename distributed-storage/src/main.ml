@@ -229,6 +229,22 @@ let root =
     & opt (some string) None
     & info ~docv:"ROOT" ~doc:"root directory to server" [ "r"; "root" ])
 
+let trim_period =
+  let doc = "time to wait between two trims" in
+  Cmdliner.Arg.(
+    value & opt int 600
+    & info ~docv:"PERIOD" ~doc
+        ~env:(env_var "DUNE_CACHE_TRIM_PERIOD" ~doc)
+        [ "trim-period" ])
+
+let trim_size =
+  let doc = "time to wait between two trims" in
+  Cmdliner.Arg.(
+    value & opt int64 10_000_000_000L
+    & info ~docv:"BYTES" ~doc
+        ~env:(env_var "DUNE_CACHE_TRIM_SIZE" ~doc)
+        [ "trim-size" ])
+
 let trim { root } ~goal =
   let ( let* ) = Lwt.Infix.( >>= ) in
   let files =
@@ -280,7 +296,8 @@ let trim { root } ~goal =
   else
     Logs_lwt.debug (fun m -> m "skip trimming")
 
-let main port root =
+let main port root trim_period trim_size =
+  let trim_period = float_of_int trim_period in
   Lwt_main.run
   @@
   let () =
@@ -298,8 +315,8 @@ let main port root =
       Lwt_io.establish_server_with_client_socket listen_address handler
     in
     let rec loop () =
-      let* () = Lwt_unix.sleep 3600. in
-      let* () = trim t ~goal:10000000000L in
+      let* () = Lwt_unix.sleep trim_period in
+      let* () = trim t ~goal:trim_size in
       loop ()
     in
     loop ()
@@ -313,4 +330,5 @@ let () =
   in
   let open Cmdliner in
   let doc = Term.info "dune-cache-distributed-storage" in
-  Term.exit @@ Term.(eval (const main $ port $ root, doc))
+  Term.exit
+  @@ Term.(eval (const main $ port $ root $ trim_period $ trim_size, doc))
