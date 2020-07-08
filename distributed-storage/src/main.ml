@@ -229,6 +229,57 @@ let root =
     & opt (some string) None
     & info ~docv:"ROOT" ~doc:"root directory to server" [ "r"; "root" ])
 
+let trim { root } ~goal =
+  let ( let* ) = Lwt.Infix.( >>= ) in
+  let files =
+    match Path.readdir_unsorted root with
+    | Result.Ok l -> l
+    | Result.Error e ->
+      User_error.raise
+        [ Pp.textf "unable to read storage root %s: %s" (Path.to_string root)
+            (Unix.error_message e)
+        ]
+  in
+  let f path =
+    let* () = Lwt.pause () in
+    let path = Path.relative root path in
+    let* stats =
+      try%lwt Lwt.return @@ Option.some @@ Path.stat path
+      with Unix.Unix_error (e, _, _) ->
+        let* () =
+          Logs_lwt.warn (fun m ->
+              m "unable to stat %s: %s" (Path.to_string path)
+                (Unix.error_message e))
+        in
+        Lwt.return None
+    in
+    Lwt.return
+    @@ Option.map
+         ~f:(fun stats -> (path, Int64.of_int stats.st_size, stats.st_mtime))
+         stats
+  and compare (_, _, t1) (_, _, t2) = Ordering.of_int (Stdlib.compare t1 t2) in
+  let* files = Lwt_list.filter_map_s f files in
+  let size =
+    List.fold_left ~init:0L
+      ~f:(fun size (_, bytes, _) -> Int64.add size bytes)
+      files
+  in
+  if size > goal then
+    let goal = Int64.sub size goal in
+    let* () = Logs_lwt.info (fun m -> m "trimming %Li bytes" goal) in
+    let files = List.sort ~compare files
+    and delete (trimmed : int64) (path, bytes, _) =
+      if trimmed >= goal then
+        trimmed
+      else
+        let () = Path.unlink path in
+        Int64.add trimmed bytes
+    in
+    let trimmed = List.fold_left ~init:0L ~f:delete files in
+    Logs_lwt.info (fun m -> m "trimming freed %Li bytes" trimmed)
+  else
+    Logs_lwt.debug (fun m -> m "skip trimming")
+
 let main port root =
   Lwt_main.run
   @@
@@ -246,8 +297,12 @@ let main port root =
     let* _server =
       Lwt_io.establish_server_with_client_socket listen_address handler
     in
-    let forever, _ = Lwt.wait () in
-    forever
+    let rec loop () =
+      let* () = Lwt_unix.sleep 3600. in
+      let* () = trim t ~goal:10000000000L in
+      loop ()
+    in
+    loop ()
   with Unix.Unix_error (Unix.EACCES, "bind", _) ->
     Logs_lwt.err (fun m -> m "unable to bind to port %i" port)
 
