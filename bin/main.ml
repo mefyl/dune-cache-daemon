@@ -90,7 +90,7 @@ module Distribution = struct
       |> Result.return
     | Dune_config path ->
       let ( let* ) v f = Result.bind v ~f in
-      let* config = Dune_cache_daemon.Distributed_dune.Config.of_file path in
+      let* config = Dune_cache_daemon.Config.of_file path in
       Dune_cache_daemon.Distributed_dune.make config |> Result.return
 
   let conv = Cmdliner.Arg.conv ~docv:"URL" (parse, pp)
