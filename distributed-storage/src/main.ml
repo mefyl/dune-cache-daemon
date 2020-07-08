@@ -1,11 +1,17 @@
 open Httpaf
 open Stdune
+open Dune_cache_daemon
 
-type t = { root : Path.t }
+type t =
+  { root : Path.t
+  ; ranges : Config.range list
+  }
 
 open Lwt.Infix
 
 let ( let* ) = ( >>= )
+
+exception Misdirected of Digest.t * Config.range list
 
 exception Bad_request of string
 
@@ -43,7 +49,12 @@ let error reqd status =
 let bad_request = Format.ksprintf (fun reason -> raise (Bad_request reason))
 
 module Blocks = struct
-  let get { root } reqd hash =
+  let check_range ranges address =
+    if not (Config.ranges_include ranges address) then
+      raise (Misdirected (address, ranges))
+
+  let get { root; ranges } reqd hash =
+    let () = check_range ranges hash in
     let f stats input =
       let file_size = stats.Unix.st_size in
       let response =
@@ -94,7 +105,8 @@ module Blocks = struct
     | Unix.Unix_error (Unix.EISDIR, _, _) ->
       error reqd `Not_found "block %S not found locally" (Digest.to_string hash)
 
-  let put { root } reqd hash executable =
+  let put { root; ranges } reqd hash executable =
+    let () = check_range ranges hash in
     let f output =
       let wait, resolve = Lwt.wait () in
       let request_body = Reqd.request_body reqd in
@@ -205,7 +217,10 @@ let request_handler t sockaddr reqd =
     | Bad_request reason -> error reqd `Bad_request "%s" reason
     | Method_not_allowed _ ->
       error reqd `Method_not_allowed "method not allowed"
+    | Misdirected (addr, _) ->
+      error reqd (`Code 421) "address %s not in range" (Digest.to_string addr)
   in
+
   Lwt.async respond
 
 let error_handler _ ?request:_ error start_response =
@@ -217,6 +232,15 @@ let error_handler _ ?request:_ error start_response =
   | #Status.standard as error ->
     Body.write_string response_body (Status.default_reason_phrase error) );
   Body.close_writer response_body
+
+let config =
+  let doc = "configuration file path" in
+  Cmdliner.Arg.(
+    value
+    & opt (some string) None
+    & info ~docv:"PATH" ~doc
+        ~env:(env_var "DUNE_CACHE_CONFIG" ~doc)
+        [ "config" ])
 
 let port =
   Cmdliner.Arg.(
@@ -245,7 +269,7 @@ let trim_size =
         ~env:(env_var "DUNE_CACHE_TRIM_SIZE" ~doc)
         [ "trim-size" ])
 
-let trim { root } ~goal =
+let trim { root; ranges } ~goal =
   let ( let* ) = Lwt.Infix.( >>= ) in
   let files =
     match Path.readdir_unsorted root with
@@ -275,10 +299,29 @@ let trim { root } ~goal =
          stats
   and compare (_, _, t1) (_, _, t2) = Ordering.of_int (Stdlib.compare t1 t2) in
   let* files = Lwt_list.filter_map_s f files in
-  let size =
-    List.fold_left ~init:0L
-      ~f:(fun size (_, bytes, _) -> Int64.add size bytes)
-      files
+  let* size =
+    let f size (path, bytes, _) =
+      match
+        let ( let* ) v f = Option.bind ~f v in
+        let basename = Path.basename path in
+        let* hash = Digest.from_hex basename in
+        Some (Config.ranges_include ranges hash)
+      with
+      | Some true -> Lwt.return @@ Int64.add size bytes
+      | Some false ->
+        let* () =
+          Logs_lwt.warn (fun m ->
+              m "remove out-of-range file: %s" (Path.to_string path))
+        in
+        Lwt.return size
+      | None ->
+        let* () =
+          Logs_lwt.warn (fun m ->
+              m "remove unrecognized file: %s" (Path.to_string path))
+        in
+        Lwt.return size
+    in
+    Lwt_list.fold_left_s f 0L files
   in
   if size > goal then
     let goal = Int64.sub size goal in
@@ -296,14 +339,38 @@ let trim { root } ~goal =
   else
     Logs_lwt.debug (fun m -> m "skip trimming")
 
-let main port root trim_period trim_size =
+let main config port root trim_period trim_size =
+  let ranges =
+    match config with
+    | None -> [ Config.range_total ]
+    | Some path -> (
+      let path = Path.of_filename_relative_to_initial_cwd path in
+      match Config.of_file path with
+      | Result.Ok c -> (
+        let self = Uri.make ~host:(Unix.gethostname ()) ~port () in
+        let f { Config.hostname; _ } =
+          (* FIXME: also lookup ourselves by IP *)
+          let hostname = Uri.with_scheme hostname None in
+          Uri.equal hostname self
+        in
+        match List.find ~f c.nodes with
+        | Some { space; _ } -> space
+        | None ->
+          User_error.raise
+            [ Pp.textf "unable to find self (%s) in configuration file"
+                (Uri.to_string self)
+            ] )
+      | Result.Error e ->
+        User_error.raise
+          [ Pp.textf "configuration error in %s: %s" (Path.to_string path) e ] )
+  in
   let trim_period = float_of_int trim_period in
   Lwt_main.run
   @@
   let () =
     try Unix.mkdir root 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
   in
-  let t = { root = Path.of_string root } in
+  let t = { root = Path.of_string root; ranges } in
   let request_handler = request_handler t in
   let handler =
     Httpaf_lwt_unix.Server.create_connection_handler ~request_handler
@@ -331,4 +398,5 @@ let () =
   let open Cmdliner in
   let doc = Term.info "dune-cache-distributed-storage" in
   Term.exit
-  @@ Term.(eval (const main $ port $ root $ trim_period $ trim_size, doc))
+  @@ Term.(
+       eval (const main $ config $ port $ root $ trim_period $ trim_size, doc))

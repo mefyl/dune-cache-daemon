@@ -1,7 +1,7 @@
 (executable
  (name main)
- (libraries cmdliner dune-private-libs.stdune httpaf httpaf-lwt-unix logs.fmt
-   logs.lwt lwt lwt.unix)
+ (libraries cmdliner dune_cache_daemon dune-private-libs.stdune httpaf
+   httpaf-lwt-unix logs.fmt logs.lwt lwt lwt.unix)
  (public_name dune-cache-distributed-storage)
  (preprocess
   (pps lwt_ppx)))

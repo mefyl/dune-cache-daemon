@@ -14,13 +14,7 @@ let make cache config = { cache; config }
 let debug = Dune_util.Log.info
 
 let find_target t target =
-  let f node =
-    let f (start, end_) =
-      Digest.compare start target <> Ordering.Gt
-      && Digest.compare target end_ <> Ordering.Gt
-    in
-    Option.is_some @@ List.find ~f node.Config.space
-  in
+  let f node = Config.ranges_include node.Config.space target in
   match List.find t.config.nodes ~f with
   | Some t -> Result.return t.hostname
   | None ->

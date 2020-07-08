@@ -80,13 +80,13 @@ module Distribution = struct
     | Memory -> Dune_cache_daemon.Distributed.irmin |> Result.return
     | Git path -> Dune_cache_daemon.Distributed.irmin_git path |> Result.return
     | Dune_endpoint uri ->
-      let min =
-        Digest.from_hex "00000000000000000000000000000000" |> Option.value_exn
-      and max =
-        Digest.from_hex "ffffffffffffffffffffffffffffffff" |> Option.value_exn
-      in
       Dune_cache_daemon.Distributed_dune.make
-        { nodes = [ { hostname = uri; space = [ (min, max) ] } ] }
+        { nodes =
+            [ { hostname = uri
+              ; space = [ Dune_cache_daemon.Config.range_total ]
+              }
+            ]
+        }
       |> Result.return
     | Dune_config path ->
       let ( let* ) v f = Result.bind v ~f in

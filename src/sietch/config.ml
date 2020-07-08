@@ -71,3 +71,18 @@ let of_file path =
     Result.Error
       ("unrecognized configuration file first statement: " ^ Sexp.to_string head)
   | [] -> Result.Error "empty configuration file"
+
+let range_total =
+  let min =
+    Digest.from_hex "00000000000000000000000000000000" |> Option.value_exn
+  and max =
+    Digest.from_hex "ffffffffffffffffffffffffffffffff" |> Option.value_exn
+  in
+  (min, max)
+
+let range_includes (start, end_) a =
+  Digest.compare start a <> Ordering.Gt && Digest.compare a end_ <> Ordering.Gt
+
+let ranges_include ranges a =
+  let f range = range_includes range a in
+  List.find ~f ranges |> Option.is_some
