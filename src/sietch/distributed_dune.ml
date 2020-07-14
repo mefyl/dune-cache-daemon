@@ -67,31 +67,40 @@ let get_file t target path local_path =
 
 let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
     =
-  try%lwt
-    let insert_file { Cache.File.digest; _ } =
-      let path = Local.file_path cache digest in
-      let insert input =
-        let body =
-          let read () =
-            let%lwt res = Lwt_io.read ~count:512 input in
-            if res <> "" then
-              Some res |> Lwt.return
-            else
-              None |> Lwt.return
+  let f =
+    let* () =
+      match metadata.contents with
+      | Files files ->
+        let insert_file { Cache.File.digest; _ } =
+          let path = Local.file_path cache digest in
+          let insert input =
+            let body =
+              let read () =
+                let%lwt res = Lwt_io.read ~count:512 input in
+                if res <> "" then
+                  Some res |> Lwt.return
+                else
+                  None |> Lwt.return
+              in
+              Lwt_stream.from read |> Cohttp_lwt.Body.of_stream
+            in
+            let path = "blocks/" ^ Digest.to_string digest in
+            let* status, _body = call t digest `PUT ~body path in
+            Lwt.return
+            @@ expect_status [ `Created; `No_content ] `PUT path status
           in
-          Lwt_stream.from read |> Cohttp_lwt.Body.of_stream
+          Lwt_io.with_file ~mode:Lwt_io.input (Path.to_string path) insert
         in
-        let path = "blocks/" ^ Digest.to_string digest in
-        let* status, _body = call t digest `PUT ~body path in
-        Lwt.return @@ expect_status [ `Created; `No_content ] `PUT path status
-      in
-      Lwt_io.with_file ~mode:Lwt_io.input (Path.to_string path) insert
+        let%lwt results = Lwt.all @@ List.map ~f:insert_file files in
+        let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
+        Lwt_result.return ()
+      | Value _ -> Lwt_result.fail "ignoring Jenga value"
     in
-    let%lwt results = Lwt.all @@ List.map ~f:insert_file metadata.files in
-    let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
     put_contents t key
       ("blocks/" ^ Digest.to_string key)
       (Cache.Local.Metadata_file.to_string metadata)
+  in
+  try%lwt f
   with e -> failwith ("distribute fatal error: " ^ Printexc.to_string e)
 
 let prefetch ({ cache; _ } as t) key =
@@ -108,14 +117,21 @@ let prefetch ({ cache; _ } as t) key =
       let* status, body = call t key `GET path in
       let* () = expect_status [ `OK ] `GET path status |> Lwt.return in
       let* metadata = Cache.Local.Metadata_file.of_string body |> Lwt.return in
-      let fetch { Cache.File.digest; _ } =
-        get_file t digest
-          ("blocks/" ^ Digest.to_string digest)
-          (Local.file_path cache digest)
-      in
-      let%lwt results = Lwt.all @@ List.map ~f:fetch metadata.files in
-      let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
-      write_file cache local_path false body
+      match metadata.contents with
+      | Files files ->
+        let fetch { Cache.File.digest; _ } =
+          get_file t digest
+            ("blocks/" ^ Digest.to_string digest)
+            (Local.file_path cache digest)
+        in
+        let%lwt results = Lwt.all @@ List.map ~f:fetch files in
+        let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
+        write_file cache local_path false body
+      | Value h ->
+        let () =
+          debug [ Pp.textf "skipping Jenga value: %s" (Digest.to_string h) ]
+        in
+        Lwt_result.return ()
   with e -> failwith ("prefetch fatal error: " ^ Printexc.to_string e)
 
 let index_path name key =
