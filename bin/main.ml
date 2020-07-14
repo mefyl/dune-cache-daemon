@@ -48,8 +48,6 @@ let endpoint_path =
 module Distribution = struct
   type t =
     | Disabled
-    | Memory
-    | Git of Path.t
     | Dune_endpoint of Uri.t
     | Dune_config of Path.t
 
@@ -58,8 +56,6 @@ module Distribution = struct
   let parse s =
     let uri = Uri.of_string s in
     match Uri.scheme uri with
-    | Some "memory" -> Result.Ok Memory
-    | Some "git" -> Result.Ok (Git (Path.of_string (Uri.path uri)))
     | Some "http"
     | Some "https" ->
       Result.Ok (Dune_endpoint uri)
@@ -70,15 +66,11 @@ module Distribution = struct
 
   let pp fmt = function
     | Disabled -> ()
-    | Memory -> Format.pp_print_string fmt "memory://"
-    | Git path -> Format.fprintf fmt "git://%s" (Path.to_string path)
     | Dune_endpoint uri -> Uri.pp fmt uri
     | Dune_config path -> Format.pp_print_string fmt (Path.to_string path)
 
   let decode = function
     | Disabled -> Dune_cache_daemon.Distributed.disabled |> Result.return
-    | Memory -> Dune_cache_daemon.Distributed.irmin |> Result.return
-    | Git path -> Dune_cache_daemon.Distributed.irmin_git path |> Result.return
     | Dune_endpoint uri ->
       Dune_cache_daemon.Distributed_dune.make
         { nodes =

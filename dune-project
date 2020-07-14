@@ -26,12 +26,8 @@
   (csexp
    (= 1.2.3))
   cmdliner
-  git-unix
   httpaf
   httpaf-lwt-unix
-  irmin
-  irmin-git
-  irmin-mem
   logs
   lwt
   lwt_ppx))
