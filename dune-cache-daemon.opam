@@ -13,11 +13,15 @@ depends: [
   "dune-private-libs" {>= "2.4.0"}
   "csexp" {= "1.2.3"}
   "cmdliner"
+  "cohttp"
+  "cohttp-lwt-unix"
   "httpaf"
   "httpaf-lwt-unix"
   "logs"
   "lwt"
   "lwt_ppx"
+  "sexplib"
+  "uri"
 ]
 build: [
   ["dune" "subst"] {pinned}

@@ -2,8 +2,8 @@
 
 (library
  (name dune_cache_daemon)
- (libraries csexp dune-private-libs.cache dune-private-libs.stdune irmin
-   irmin-git irmin-mem lwt lwt.unix git-unix)
+ (libraries cohttp cohttp-lwt-unix csexp dune-private-libs.cache
+   dune-private-libs.stdune logs lwt lwt.unix sexplib uri)
  (synopsis "Dune distributed binary artifacts cache")
  (preprocess
   (pps lwt_ppx)))

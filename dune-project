@@ -26,8 +26,12 @@
   (csexp
    (= 1.2.3))
   cmdliner
+  cohttp
+  cohttp-lwt-unix
   httpaf
   httpaf-lwt-unix
   logs
   lwt
-  lwt_ppx))
+  lwt_ppx
+  sexplib
+  uri))
