@@ -36,7 +36,7 @@ let path_conv =
   let pp formatter path =
     Format.pp_print_string formatter @@ Path.to_string path
   in
-  ((fun s -> `Ok (Path.of_string s)), pp)
+  ((fun s -> `Ok (Path.of_filename_relative_to_initial_cwd s)), pp)
 
 let endpoint_path =
   Arg.(
