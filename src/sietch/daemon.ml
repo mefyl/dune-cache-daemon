@@ -259,7 +259,7 @@ let client_thread daemon client =
         let f k = D.prefetch k in
         let prefetching () =
           let* results = Lwt_list.map_s f keys in
-          List.iter ~f:(log_error (peer_name client.peer) "distribute") results
+          List.iter ~f:(log_error (peer_name client.peer) "prefetching") results
           |> Lwt.return
         in
         Lwt.async prefetching;
