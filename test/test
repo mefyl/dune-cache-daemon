@@ -5,7 +5,7 @@ cleanup () {
 }
 
 wait_file () {
-    while ! test -e ./endpoint || test -z "$(cat "$1")"; do
+    while ! test -e "$1" || test -z "$(cat "$1")"; do
         sleep .1
     done
 }
