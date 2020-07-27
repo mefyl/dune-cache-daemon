@@ -1,8 +1,17 @@
+open Stdune
+
+let path =
+  let parse s =
+    Result.return @@ Path.of_filename_relative_to_initial_cwd s
+  and print fmt p = Format.pp_print_string fmt (Path.to_string p)
+  in
+  Cmdliner.Arg.conv ~docv:"PATH" (parse, print)
+
 let config =
   let doc = "configuration file path" in
   Cmdliner.Arg.(
     value
-    & opt (some string) None
+    & opt (some path) None
     & info ~docv:"PATH" ~doc
         ~env:(env_var "DUNE_CACHE_CONFIG" ~doc)
         [ "config" ])
@@ -15,7 +24,7 @@ let port =
 let root =
   Cmdliner.Arg.(
     required
-    & opt (some string) None
+    & opt (some path) None
     & info ~docv:"ROOT" ~doc:"root directory to server" [ "r"; "root" ])
 
 let trim_period =

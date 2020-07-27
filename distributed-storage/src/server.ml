@@ -300,7 +300,6 @@ let run config port root trim_period trim_size =
     match config with
     | None -> [ Config.range_total ]
     | Some path -> (
-      let path = Path.of_filename_relative_to_initial_cwd path in
       match Config.of_file path with
       | Result.Ok c -> (
         let self = Uri.make ~host:(Unix.gethostname ()) ~port () in
@@ -324,9 +323,9 @@ let run config port root trim_period trim_size =
   Lwt_main.run
   @@
   let () =
-    try Unix.mkdir root 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+    try Unix.mkdir (Path.to_string root) 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
   in
-  let t = { root = Path.of_string root; ranges } in
+  let t = { root; ranges } in
   let request_handler = request_handler t in
   let handler =
     Httpaf_lwt_unix.Server.create_connection_handler ~request_handler
