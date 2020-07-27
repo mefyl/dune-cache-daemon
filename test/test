@@ -16,6 +16,7 @@ trap cleanup INT ERR
 
 ../_build/default/distributed-storage/src/main.exe --root ./storage --port 8080  --config ./config&
 STORAGE_PID=$!
+sleep 1
 
 ../_build/default/bin/main.exe start -f --distribution ./config --endpoint-file ./endpoint --root ./cache&
 DAEMON_PID=$!
