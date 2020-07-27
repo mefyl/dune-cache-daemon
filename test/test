@@ -1,5 +1,7 @@
 #!/bin/sh -eEx
 
+rm -rf endpoint new-cache storage
+
 cleanup () {
     kill -15 "$DAEMON_PID" "$STORAGE_PID"
 }
