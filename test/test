@@ -1,0 +1,33 @@
+#!/bin/sh -eEx
+
+cleanup () {
+    kill -15 "$DAEMON_PID" "$STORAGE_PID"
+}
+
+wait_file () {
+    while ! test -e ./endpoint || test -z "$(cat "$1")"; do
+        sleep .1
+    done
+}
+
+trap cleanup INT ERR
+
+../_build/default/distributed-storage/src/main.exe --root ./storage --port 8080  --config ./config&
+STORAGE_PID=$!
+
+../_build/default/bin/main.exe start -f --distribution ./config --endpoint-file ./endpoint --root ./cache&
+DAEMON_PID=$!
+wait_file "./endpoint"
+
+echo "(4:lang19:dune-cache-protocol(1:11:2))(8:promoted(3:key32:ffff494926fcbeb5ba9ebb390faa7c9c))" | socat - $(cat ./endpoint)
+wait_file "storage/9e1cefe808e3663b1dd476e91081fdd9"
+kill -2 "$DAEMON_PID"
+
+../_build/default/bin/main.exe start -f --distribution ./config --endpoint-file ./endpoint --root ./new-cache&
+DAEMON_PID=$!
+wait_file "./endpoint"
+
+echo "(4:lang19:dune-cache-protocol(1:11:2))(4:hint32:ffff494926fcbeb5ba9ebb390faa7c9c)" | socat - $(cat ./endpoint)
+wait_file "new-cache/files/v3/9e/9e1cefe808e3663b1dd476e91081fdd9"
+
+cleanup

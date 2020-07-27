@@ -1,0 +1,5 @@
+(lang dune-distributed-cache 1.0)
+
+(node
+ (hostname http://zero:8080)
+ (range 0x0000 0xffff))
