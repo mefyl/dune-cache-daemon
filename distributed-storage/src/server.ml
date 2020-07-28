@@ -68,6 +68,31 @@ module Blocks = struct
       error reqd `Internal_server_error "unable to read block %S"
         (Digest.to_string hash)
 
+  let head { root; ranges } reqd hash =
+    let () = check_range ranges hash in
+    let path = Path.relative root (Digest.to_string hash) in
+    let head =
+      let stats = Path.stat path in
+      let* () =
+        Logs_lwt.info (fun m -> m "> %s [0 bytes]" (status_to_string `OK))
+      in
+      let response =
+        let headers =
+          Headers.of_list
+            [ ("Content-length", "0")
+            ; ( "X-executable"
+              , if stats.st_perm land 0o100 <> 0 then
+                  "1"
+                else
+                  "0" )
+            ]
+        in
+        Response.create ~headers `OK
+      in
+      Lwt.return @@ Reqd.respond_with_string reqd response ""
+    in
+    handle_errors hash path reqd head
+
   let get { root; ranges } reqd hash =
     let () = check_range ranges hash in
     let path = Path.relative root (Digest.to_string hash) in
@@ -182,6 +207,7 @@ let request_handler t sockaddr reqd =
     in
     let meth =
       match meth with
+      | `HEAD -> `HEAD
       | `GET -> `GET
       | `PUT -> `PUT
       | _ -> raise (Method_not_allowed meth)
@@ -195,6 +221,7 @@ let request_handler t sockaddr reqd =
           | None -> bad_request "invalid hash: %S" hash
         in
         match meth with
+        | `HEAD -> Blocks.head t reqd hash
         | `GET -> Blocks.get t reqd hash
         | `PUT ->
           let executable = Headers.get headers "X-executable" = Some "1" in
@@ -202,6 +229,7 @@ let request_handler t sockaddr reqd =
       | [ ""; "index"; index; hash ] -> (
         let hash = Digest.string (index ^ hash) in
         match meth with
+        | `HEAD -> raise (Method_not_allowed meth)
         | `GET -> Blocks.get t reqd hash
         | `PUT -> Blocks.put t reqd hash false )
       | path ->
