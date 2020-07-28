@@ -295,7 +295,7 @@ let trim { root; ranges } ~goal =
   else
     Logs_lwt.debug (fun m -> m "skip trimming")
 
-let run config port root trim_period trim_size =
+let run config host port root trim_period trim_size =
   let ranges =
     match config with
     | None -> [ Config.range_total ]
@@ -323,7 +323,8 @@ let run config port root trim_period trim_size =
   Lwt_main.run
   @@
   let () =
-    try Unix.mkdir (Path.to_string root) 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+    try Unix.mkdir (Path.to_string root) 0o700
+    with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
   in
   let t = { root; ranges } in
   let request_handler = request_handler t in
@@ -331,7 +332,7 @@ let run config port root trim_period trim_size =
     Httpaf_lwt_unix.Server.create_connection_handler ~request_handler
       ~error_handler
   in
-  let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
+  let listen_address = Unix.(ADDR_INET (host, port)) in
   try%lwt
     let* _server =
       Lwt_io.establish_server_with_client_socket listen_address handler
