@@ -52,7 +52,9 @@ module Blocks = struct
 
   let handle_errors hash path reqd f =
     try%lwt f with
-    | Unix.Unix_error (Unix.ENOENT, _, _)
+    | Unix.Unix_error (Unix.ENOENT, _, _) ->
+      error reqd `No_content "block %S not found locally"
+        (Digest.to_string hash)
     | Unix.Unix_error (Unix.EISDIR, _, _) ->
       let* () =
         Logs_lwt.err (fun m ->
@@ -74,9 +76,7 @@ module Blocks = struct
     let read =
       let* () = Lwt.pause () in
       let stats = Path.stat path in
-      let* () =
-        Logs_lwt.info (fun m -> m "> %s [0 bytes]" (status_to_string `OK))
-      in
+      let* () = Logs_lwt.info (fun m -> m "> %s" (status_to_string `OK)) in
       let headers =
         [ ( "X-executable"
           , if stats.st_perm land 0o100 <> 0 then
