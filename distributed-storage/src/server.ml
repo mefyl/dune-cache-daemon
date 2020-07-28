@@ -68,48 +68,46 @@ module Blocks = struct
       error reqd `Internal_server_error "unable to read block %S"
         (Digest.to_string hash)
 
-  let head { root; ranges } reqd hash =
+  let read { root; ranges } reqd hash f =
     let () = check_range ranges hash in
     let path = Path.relative root (Digest.to_string hash) in
-    let head =
+    let read =
       let stats = Path.stat path in
       let* () =
         Logs_lwt.info (fun m -> m "> %s [0 bytes]" (status_to_string `OK))
       in
+      let headers =
+        [ ( "X-executable"
+          , if stats.st_perm land 0o100 <> 0 then
+              "1"
+            else
+              "0" )
+        ]
+      in
+      f path stats headers
+    in
+    handle_errors hash path reqd read
+
+  let head t reqd hash =
+    let f _ _ headers =
       let response =
-        let headers =
-          Headers.of_list
-            [ ("Content-length", "0")
-            ; ( "X-executable"
-              , if stats.st_perm land 0o100 <> 0 then
-                  "1"
-                else
-                  "0" )
-            ]
-        in
+        let headers = Headers.of_list @@ (("Content-length", "0") :: headers) in
         Response.create ~headers `OK
       in
       Lwt.return @@ Reqd.respond_with_string reqd response ""
     in
-    handle_errors hash path reqd head
+    read t reqd hash f
 
-  let get { root; ranges } reqd hash =
-    let () = check_range ranges hash in
-    let path = Path.relative root (Digest.to_string hash) in
-    let get =
+  let get t reqd hash =
+    let f path stats headers =
       let f stats input =
         let file_size = stats.Unix.st_size in
         let response =
           let headers =
             Headers.of_list
-              [ ("Content-length", string_of_int file_size)
-              ; ("Content-type", "application/octet-stream")
-              ; ( "X-executable"
-                , if stats.st_perm land 0o100 <> 0 then
-                    "1"
-                  else
-                    "0" )
-              ]
+            @@ ("Content-length", string_of_int file_size)
+               :: ("Content-type", "application/octet-stream")
+               :: headers
           in
           Response.create ~headers `OK
         in
@@ -134,15 +132,14 @@ module Blocks = struct
         let* () = loop () in
         let* () =
           Logs_lwt.info (fun m ->
-              m "> %s [%i bytes]" (status_to_string `OK) size)
+              m "> %s [%i bytes]" (status_to_string `OK) file_size)
         in
         Lwt.return @@ Body.close_writer body
       in
-      let stats = Path.stat path in
       Lwt_io.with_file ~flags:[ Unix.O_RDONLY ] ~mode:Lwt_io.input
         (Path.to_string path) (f stats)
     in
-    handle_errors hash path reqd get
+    read t reqd hash f
 
   let put { root; ranges } reqd hash executable =
     let () = check_range ranges hash in
