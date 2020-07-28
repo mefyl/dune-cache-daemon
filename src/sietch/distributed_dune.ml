@@ -73,6 +73,11 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
       | Files files ->
         let insert_file { Cache.File.digest; _ } =
           let path = Local.file_path cache digest in
+          let query meth body =
+            let path = "blocks/" ^ Digest.to_string digest in
+            let* status, _body = call t digest meth ~body path in
+            Lwt_result.return status
+          in
           let insert input =
             let body =
               let read () =
@@ -84,12 +89,29 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
               in
               Lwt_stream.from read |> Cohttp_lwt.Body.of_stream
             in
-            let path = "blocks/" ^ Digest.to_string digest in
-            let* status, _body = call t digest `PUT ~body path in
-            Lwt.return
-            @@ expect_status [ `Created; `No_content ] `PUT path status
+            query `PUT body
           in
-          Lwt_io.with_file ~mode:Lwt_io.input (Path.to_string path) insert
+          let stats = Path.stat path in
+          let* upload =
+            if stats.st_size < 4096 then
+              Lwt_result.return true
+            else
+              let* status = query `HEAD (Cohttp_lwt.Body.of_string "") in
+              let* () =
+                Lwt.return
+                @@ expect_status [ `OK; `No_content ] `HEAD
+                     (Path.to_string path) status
+              in
+              Lwt_result.return (status = `No_content)
+          in
+          if upload then
+            let* status =
+              Lwt_io.with_file ~mode:Lwt_io.input (Path.to_string path) insert
+            in
+            Lwt.return
+            @@ expect_status [ `Created; `OK ] `PUT (Path.to_string path) status
+          else
+            Lwt_result.return ()
         in
         let%lwt results = Lwt.all @@ List.map ~f:insert_file files in
         let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
