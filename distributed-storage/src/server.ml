@@ -72,6 +72,7 @@ module Blocks = struct
     let () = check_range ranges hash in
     let path = Path.relative root (Digest.to_string hash) in
     let read =
+      let* () = Lwt.pause () in
       let stats = Path.stat path in
       let* () =
         Logs_lwt.info (fun m -> m "> %s [0 bytes]" (status_to_string `OK))
@@ -239,7 +240,6 @@ let request_handler t sockaddr reqd =
     | Misdirected (addr, _) ->
       error reqd (`Code 421) "address %s not in range" (Digest.to_string addr)
   in
-
   Lwt.async respond
 
 let error_handler _ ?request:_ error start_response =
