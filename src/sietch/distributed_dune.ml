@@ -182,7 +182,8 @@ let index_prefetch t name key =
       Lwt_result.return ()
     else
       Lwt_result.return ()
-  with e -> failwith ("index_prefetech fatal error: " ^ Printexc.to_string e)
+  with e ->
+    Lwt_result.fail ("index_prefetch fatal error: " ^ Printexc.to_string e)
 
 let make config local =
   ( module struct
