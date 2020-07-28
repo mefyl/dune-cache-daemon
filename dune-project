@@ -33,5 +33,9 @@
   logs
   lwt
   lwt_ppx
+  (ocamlformat
+   (and
+    (= 0.14.3)
+    :dev))
   sexplib
   uri))
