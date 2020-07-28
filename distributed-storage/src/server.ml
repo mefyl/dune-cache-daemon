@@ -50,109 +50,9 @@ module Blocks = struct
     if not (Config.ranges_include ranges address) then
       raise (Misdirected (address, ranges))
 
-  let get { root; ranges } reqd hash =
-    let () = check_range ranges hash in
-    let f stats input =
-      let file_size = stats.Unix.st_size in
-      let response =
-        let headers =
-          Headers.of_list
-            [ ("Content-length", string_of_int file_size)
-            ; ("Content-type", "application/octet-stream")
-            ; ( "X-executable"
-              , if stats.st_perm land 0o100 <> 0 then
-                  "1"
-                else
-                  "0" )
-            ]
-        in
-        Response.create ~headers `OK
-      in
-      let body = Reqd.respond_with_streaming reqd response in
-      let size = 4096 in
-      let buffer = Bytes.make size '\x00' in
-      let bigstring = Bigstringaf.create size in
-      let rec loop () =
-        Lwt_io.read_into input buffer 0 size >>= function
-        | 0 -> Lwt.return ()
-        | read ->
-          let () =
-            Bigstringaf.unsafe_blit_from_bytes buffer ~src_off:0 bigstring
-              ~dst_off:0 ~len:read
-          in
-          let () = Body.schedule_bigstring body bigstring
-          and wait, resolve = Lwt.wait () in
-          let () = Body.flush body (Lwt.wakeup resolve) in
-          let* () = wait in
-          loop ()
-      in
-      let* () = loop () in
-      let* () =
-        Logs_lwt.info (fun m -> m "> %s [%i bytes]" (status_to_string `OK) size)
-      in
-      Lwt.return @@ Body.close_writer body
-    in
-    try%lwt
-      let path = Path.relative root (Digest.to_string hash) in
-      let stats = Path.stat path in
-      Lwt_io.with_file ~flags:[ Unix.O_RDONLY ] ~mode:Lwt_io.input
-        (Path.to_string path) (f stats)
-    with
+  let handle_errors hash path reqd f =
+    try%lwt f with
     | Unix.Unix_error (Unix.ENOENT, _, _)
-    | Unix.Unix_error (Unix.EISDIR, _, _) ->
-      error reqd `Not_found "block %S not found locally" (Digest.to_string hash)
-
-  let put { root; ranges } reqd hash executable =
-    let () = check_range ranges hash in
-    let f output =
-      let wait, resolve = Lwt.wait () in
-      let request_body = Reqd.request_body reqd in
-      let size = 1024 in
-      let buffer = Bytes.make size '\x00' in
-      let rec on_read bs ~off ~len =
-        let rec blit blit_from blit_end =
-          if blit_from = blit_end then
-            Lwt.return @@ Body.schedule_read request_body ~on_eof ~on_read
-          else
-            let len = min (blit_end - blit_from) size in
-            let () =
-              Bigstringaf.unsafe_blit_to_bytes bs ~src_off:blit_from buffer
-                ~dst_off:0 ~len
-            in
-            let rec write write_from =
-              if write_from = len then
-                blit (blit_from + len) blit_end
-              else
-                let* written =
-                  Lwt_io.write_from output buffer write_from (len - write_from)
-                in
-                write (write_from + written)
-            in
-            write 0
-        in
-        Lwt.async (fun () -> blit off (off + len))
-      and on_eof () =
-        Lwt.async (fun () ->
-            let* () = response reqd `Created in
-            Lwt.return @@ Lwt.wakeup resolve ())
-      in
-      let () = Body.schedule_read request_body ~on_eof ~on_read in
-      wait
-    in
-    let path = Path.relative root (Digest.to_string hash)
-    and perm =
-      if executable then
-        0o700
-      else
-        0o600
-    in
-    try%lwt
-      Lwt_io.with_file
-        ~flags:[ Unix.O_CREAT; Unix.O_TRUNC; Unix.O_WRONLY ]
-        ~perm ~mode:Lwt_io.output (Path.to_string path) f
-    with
-    | Unix.Unix_error (Unix.ENOENT, _, _) ->
-      error reqd `Not_found "block %S not found locally" (Digest.to_string hash)
     | Unix.Unix_error (Unix.EISDIR, _, _) ->
       let* () =
         Logs_lwt.err (fun m ->
@@ -167,6 +67,108 @@ module Blocks = struct
       in
       error reqd `Internal_server_error "unable to read block %S"
         (Digest.to_string hash)
+
+  let get { root; ranges } reqd hash =
+    let () = check_range ranges hash in
+    let path = Path.relative root (Digest.to_string hash) in
+    let get =
+      let f stats input =
+        let file_size = stats.Unix.st_size in
+        let response =
+          let headers =
+            Headers.of_list
+              [ ("Content-length", string_of_int file_size)
+              ; ("Content-type", "application/octet-stream")
+              ; ( "X-executable"
+                , if stats.st_perm land 0o100 <> 0 then
+                    "1"
+                  else
+                    "0" )
+              ]
+          in
+          Response.create ~headers `OK
+        in
+        let body = Reqd.respond_with_streaming reqd response in
+        let size = 4096 in
+        let buffer = Bytes.make size '\x00' in
+        let bigstring = Bigstringaf.create size in
+        let rec loop () =
+          Lwt_io.read_into input buffer 0 size >>= function
+          | 0 -> Lwt.return ()
+          | read ->
+            let () =
+              Bigstringaf.unsafe_blit_from_bytes buffer ~src_off:0 bigstring
+                ~dst_off:0 ~len:read
+            in
+            let () = Body.schedule_bigstring body bigstring
+            and wait, resolve = Lwt.wait () in
+            let () = Body.flush body (Lwt.wakeup resolve) in
+            let* () = wait in
+            loop ()
+        in
+        let* () = loop () in
+        let* () =
+          Logs_lwt.info (fun m ->
+              m "> %s [%i bytes]" (status_to_string `OK) size)
+        in
+        Lwt.return @@ Body.close_writer body
+      in
+      let stats = Path.stat path in
+      Lwt_io.with_file ~flags:[ Unix.O_RDONLY ] ~mode:Lwt_io.input
+        (Path.to_string path) (f stats)
+    in
+    handle_errors hash path reqd get
+
+  let put { root; ranges } reqd hash executable =
+    let () = check_range ranges hash in
+    let path = Path.relative root (Digest.to_string hash) in
+    let put =
+      let f output =
+        let wait, resolve = Lwt.wait () in
+        let request_body = Reqd.request_body reqd in
+        let size = 1024 in
+        let buffer = Bytes.make size '\x00' in
+        let rec on_read bs ~off ~len =
+          let rec blit blit_from blit_end =
+            if blit_from = blit_end then
+              Lwt.return @@ Body.schedule_read request_body ~on_eof ~on_read
+            else
+              let len = min (blit_end - blit_from) size in
+              let () =
+                Bigstringaf.unsafe_blit_to_bytes bs ~src_off:blit_from buffer
+                  ~dst_off:0 ~len
+              in
+              let rec write write_from =
+                if write_from = len then
+                  blit (blit_from + len) blit_end
+                else
+                  let* written =
+                    Lwt_io.write_from output buffer write_from (len - write_from)
+                  in
+                  write (write_from + written)
+              in
+              write 0
+          in
+          Lwt.async (fun () -> blit off (off + len))
+        and on_eof () =
+          Lwt.async (fun () ->
+              let* () = response reqd `Created in
+              Lwt.return @@ Lwt.wakeup resolve ())
+        in
+        let () = Body.schedule_read request_body ~on_eof ~on_read in
+        wait
+      in
+      let perm =
+        if executable then
+          0o700
+        else
+          0o600
+      in
+      Lwt_io.with_file
+        ~flags:[ Unix.O_CREAT; Unix.O_TRUNC; Unix.O_WRONLY ]
+        ~perm ~mode:Lwt_io.output (Path.to_string path) f
+    in
+    handle_errors hash path reqd put
 end
 
 let request_handler t sockaddr reqd =
