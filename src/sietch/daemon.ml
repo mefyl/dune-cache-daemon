@@ -278,10 +278,13 @@ let client_thread daemon client =
       | Promoted ({ key; _ } as promotion) ->
         let* metadata =
           let* sexp =
-            Cache.Local.metadata_path client.cache key
-            |> Io.read_file |> Csexp.parse_string
-            |> Result.map_error ~f:(fun (_, e) -> `Parse_error e)
-            |> Lwt.return
+            try
+              Cache.Local.metadata_path client.cache key
+              |> Io.read_file |> Csexp.parse_string
+              |> Result.map_error ~f:(fun (_, e) -> `Parse_error e)
+              |> Lwt.return
+            with Sys_error _ ->
+              Lwt_result.fail @@ `Read_error "metadata filed disappeared"
           in
           Cache.Local.Metadata_file.of_sexp sexp
           |> Result.map_error ~f:(fun e -> `Parse_error e)
