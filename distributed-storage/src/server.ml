@@ -113,7 +113,7 @@ module Blocks = struct
           Response.create ~headers `OK
         in
         let body = Reqd.respond_with_streaming reqd response in
-        let size = 4096 in
+        let size = 512 * 1024 in
         let buffer = Bytes.make size '\x00' in
         let bigstring = Bigstringaf.create size in
         let rec loop () =
@@ -142,6 +142,30 @@ module Blocks = struct
     in
     read t reqd hash f
 
+  type disk_buffer =
+    { buffer : Bytes.t
+    ; pos : int
+    ; size : int
+    }
+
+  let write b output =
+    if b.pos = 0 then
+      Lwt.return b
+    else
+      let rec loop from =
+        if from = b.pos then
+          Lwt.return { b with pos = 0 }
+        else
+          let* written =
+            Lwt_io.write_from output b.buffer from (b.pos - from)
+          in
+          (* let* () =
+           *   Logs_lwt.debug (fun m -> m "  ... write %i bytes" written)
+           * in *)
+          loop (from + written)
+      in
+      loop 0
+
   let put { root; ranges } reqd hash executable =
     let () = check_range ranges hash in
     let path = Path.relative root (Digest.to_string hash) in
@@ -149,36 +173,44 @@ module Blocks = struct
       let f output =
         let wait, resolve = Lwt.wait () in
         let request_body = Reqd.request_body reqd in
-        let size = 1024 in
-        let buffer = Bytes.make size '\x00' in
-        let rec on_read bs ~off ~len =
-          let rec blit blit_from blit_end =
+        let rec on_read b bs ~off ~len =
+          let rec blit b blit_from blit_end =
             if blit_from = blit_end then
-              Lwt.return @@ Body.schedule_read request_body ~on_eof ~on_read
+              Lwt.return
+              @@ Body.schedule_read request_body ~on_eof:(on_eof b)
+                   ~on_read:(on_read b)
             else
-              let len = min (blit_end - blit_from) size in
+              let len = min (blit_end - blit_from) (b.size - b.pos) in
               let () =
-                Bigstringaf.unsafe_blit_to_bytes bs ~src_off:blit_from buffer
-                  ~dst_off:0 ~len
+                Bigstringaf.unsafe_blit_to_bytes bs ~src_off:blit_from b.buffer
+                  ~dst_off:b.pos ~len
               in
-              let rec write write_from =
-                if write_from = len then
-                  blit (blit_from + len) blit_end
-                else
-                  let* written =
-                    Lwt_io.write_from output buffer write_from (len - write_from)
-                  in
-                  write (write_from + written)
-              in
-              write 0
+              let b = { b with pos = b.pos + len }
+              and blit_from = blit_from + len in
+              if b.pos = b.size then
+                let* b = write b output in
+                blit b blit_from blit_end
+              else
+                blit b blit_from blit_end
           in
-          Lwt.async (fun () -> blit off (off + len))
-        and on_eof () =
           Lwt.async (fun () ->
-              let* () = response reqd `Created in
-              Lwt.return @@ Lwt.wakeup resolve ())
+              (* let* () = Logs_lwt.debug (fun m -> m " ... read %i bytes" len)
+                 in *)
+              blit b off (off + len))
+        and on_eof b () =
+          let f () =
+            let* _ = write b output in
+            let* () = response reqd `Created in
+            Lwt.return @@ Lwt.wakeup resolve ()
+          in
+          Lwt.async f
         in
-        let () = Body.schedule_read request_body ~on_eof ~on_read in
+        let () =
+          let size = 16 * 1024 * 1024 in
+          let buffer = { buffer = Bytes.make size '\x00'; pos = 0; size } in
+          Body.schedule_read request_body ~on_eof:(on_eof buffer)
+            ~on_read:(on_read buffer)
+        in
         wait
       in
       let perm =
