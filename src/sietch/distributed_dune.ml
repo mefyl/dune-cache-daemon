@@ -137,23 +137,30 @@ let prefetch ({ cache; _ } as t) key =
     else
       let path = "blocks/" ^ Digest.to_string key in
       let* status, body = call t key `GET path in
-      let* () = expect_status [ `OK ] `GET path status |> Lwt.return in
-      let* metadata = Cache.Local.Metadata_file.of_string body |> Lwt.return in
-      match metadata.contents with
-      | Files files ->
-        let fetch { Cache.File.digest; _ } =
-          get_file t digest
-            ("blocks/" ^ Digest.to_string digest)
-            (Local.file_path cache digest)
-        in
-        let%lwt results = Lwt.all @@ List.map ~f:fetch files in
-        let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
-        write_file cache local_path false body
-      | Value h ->
-        let () =
-          debug [ Pp.textf "skipping Jenga value: %s" (Digest.to_string h) ]
-        in
+      let* () =
+        expect_status [ `OK; `No_content ] `GET path status |> Lwt.return
+      in
+      if status = `No_content then
         Lwt_result.return ()
+      else
+        let* metadata =
+          Cache.Local.Metadata_file.of_string body |> Lwt.return
+        in
+        match metadata.contents with
+        | Files files ->
+          let fetch { Cache.File.digest; _ } =
+            get_file t digest
+              ("blocks/" ^ Digest.to_string digest)
+              (Local.file_path cache digest)
+          in
+          let%lwt results = Lwt.all @@ List.map ~f:fetch files in
+          let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
+          write_file cache local_path false body
+        | Value h ->
+          let () =
+            debug [ Pp.textf "skipping Jenga value: %s" (Digest.to_string h) ]
+          in
+          Lwt_result.return ()
   with e -> failwith ("prefetch fatal error: " ^ Printexc.to_string e)
 
 let index_path name key =
