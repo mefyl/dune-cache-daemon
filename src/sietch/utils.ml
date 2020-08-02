@@ -3,71 +3,6 @@ open Stdune
 
 module Csexp = struct
   include Csexp_external.Make (Sexp)
-
-  module Lwt = struct
-    module Input = struct
-      type t =
-        { channel : Lwt_io.input_channel
-        ; mutable peeked : char option
-        }
-
-      let make channel = { channel; peeked = None }
-
-      module Monad = Lwt
-
-      let ( let* ) = Lwt_result.Infix.( >>= )
-
-      (* Not exactly efficient memory-wise, but we're dealing with small
-         buffers. *)
-
-      let rec _read_string t count =
-        match t.peeked with
-        | Some c ->
-          t.peeked <- None;
-          let* s = _read_string t (count - 1) in
-          Lwt_result.return @@ String.make 1 c ^ s
-        | None -> (
-          try%lwt Lwt_io.read ~count t.channel |> Lwt.map Result.return
-          with e -> Lwt_result.fail (Printexc.to_string e) )
-
-      let rec read_string t count =
-        let* res = _read_string t count in
-        match String.length res with
-        | l when l = count -> Lwt_result.return res
-        | 0 -> Lwt_result.fail "premature end of input"
-        | l ->
-          let* rest = read_string t (count - l) in
-          Lwt_result.return (res ^ rest)
-
-      let read_char t =
-        match t.peeked with
-        | Some c ->
-          t.peeked <- None;
-          Lwt_result.return c
-        | None ->
-          let* s = read_string t 1 in
-          Lwt_result.return s.[0]
-
-      let peek_char t =
-        match t.peeked with
-        | Some c -> Lwt_result.return (Some c)
-        | None ->
-          let* s = _read_string t 1 in
-          if String.length s = 0 then
-            Lwt_result.return None
-          else
-            let c = Some s.[0] in
-            t.peeked <- c;
-            Lwt_result.return c
-    end
-
-    module Parser = struct
-      include Make_parser (Input)
-
-      let parse input =
-        parse input |> Lwt_result.map_err (fun e -> `Parse_error e)
-    end
-  end
 end
 
 let int_of_string ?where s =
@@ -115,6 +50,57 @@ module LwtrO = struct
 
   let ( let+ ) = ( >|= )
 end
+
+let read_char input =
+  try%lwt
+    let open LwtrO in
+    let* c =
+      Lwt_io.read_char input
+      |> Lwt.map (Base.Fn.compose Result.return Option.some)
+    in
+    Lwt_result.return c
+  with
+  | End_of_file -> Lwt_result.return None
+  | e -> Lwt_result.fail (`Read_error (Printexc.to_string e))
+
+let read_char_or_fail input =
+  let open LwtrO in
+  read_char input >>= function
+  | Some c -> Lwt_result.return c
+  | None -> Lwt_result.fail (`Parse_error "premature end of input")
+
+let rec read_token input lexer c stack =
+  let open LwtrO in
+  let open Csexp.Parser.Lexer in
+  match feed lexer c with
+  | Lparen -> Lwt_result.return @@ Csexp.Parser.Stack.open_paren stack
+  | Rparen -> Lwt_result.return @@ Csexp.Parser.Stack.close_paren stack
+  | Atom count -> (
+    try%lwt
+      let* atom = Lwt_io.read ~count input |> Lwt.map Result.return in
+      Lwt_result.return @@ Csexp.Parser.Stack.add_atom atom stack
+    with e -> Lwt_result.fail (`Read_error (Printexc.to_string e)) )
+  | Await -> (
+    read_char input >>= function
+    | Some c -> read_token input lexer c stack
+    | None -> Lwt_result.fail (`Parse_error "premature end of input") )
+
+let parse_sexp ?c input =
+  let open LwtrO in
+  let lexer = Csexp.Parser.Lexer.create () in
+  let* c =
+    match c with
+    | Some c -> Lwt_result.return c
+    | None -> read_char_or_fail input
+  in
+  let rec loop c stack =
+    read_token input lexer c stack >>= function
+    | Sexp (s, Empty) -> Lwt_result.return s
+    | stack ->
+      let* c = read_char_or_fail input in
+      loop c stack
+  in
+  loop c Csexp.Parser.Stack.Empty
 
 (** A barrier that let thread throughs after it has been opened for some
     duration. Enables to postpone low priority operations until main operations
