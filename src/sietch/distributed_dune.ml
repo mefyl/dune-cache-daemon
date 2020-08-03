@@ -2,8 +2,6 @@ open Stdune
 open Utils
 module Sexp = Sexplib.Sexp
 
-let ( let* ) = Lwt_result.( >>= )
-
 type t =
   { cache : Local.t
   ; config : Config.t
@@ -23,16 +21,19 @@ let find_target t target =
          (Digest.to_string target))
 
 let call t target m ?body path =
-  let* uri = find_target t target |> Lwt.return in
+  let* uri = find_target t target |> Async.return in
   let uri = Uri.with_uri ~path:(Option.some @@ Uri.path uri ^ path) uri
   and headers =
     Cohttp.Header.of_list [ ("Content-Type", "application/octet-stream") ]
   in
   let* response, body =
-    try%lwt
-      Cohttp_lwt_unix.Client.call m ~headers ?body uri |> Lwt.map Result.ok
-    with Unix.Unix_error (e, f, a) ->
-      Lwt_result.fail
+    let f () =
+      Cohttp_async.Client.call m ~headers ?body uri |> Lwt.map Result.ok
+    in
+    Async.try_with f >>= function
+    | Result.Ok v -> Async.Deferred.Result.return v
+    | Result.Error (Unix.Unix_error (e, f, a)) ->
+      Async.Deferred.Result.fail
         (Printf.sprintf "error during HTTP request %s: %s %s"
            (Unix.error_message e) f a)
   in

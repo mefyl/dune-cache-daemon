@@ -5,6 +5,10 @@ module Csexp = struct
   include Csexp_external.Make (Sexp)
 end
 
+let ( let* ) = Async.Deferred.Result.( >>= )
+
+let ( let+ ) = Async.Deferred.Result.( >>| )
+
 let int_of_string ?where s =
   match Int.of_string s with
   | Some s -> Ok s
@@ -52,50 +56,56 @@ module LwtrO = struct
 end
 
 let read_char input =
-  try%lwt
-    let open LwtrO in
-    let* c =
-      Lwt_io.read_char input
-      |> Lwt.map (Base.Fn.compose Result.return Option.some)
-    in
-    Lwt_result.return c
-  with
-  | End_of_file -> Lwt_result.return None
-  | e -> Lwt_result.fail (`Read_error (Printexc.to_string e))
+  let f () = Async.Reader.read_char input in
+  let open Async in
+  Async.try_with f >>= function
+  | Result.Ok (`Ok c) -> Deferred.Result.return @@ Some c
+  | Result.Ok `Eof -> Deferred.Result.return None
+  | Result.Error End_of_file -> Deferred.Result.return None
+  | Result.Error e -> Deferred.Result.fail (`Read_error (Printexc.to_string e))
 
 let read_char_or_fail input =
-  let open LwtrO in
+  let open Async.Deferred.Result in
   read_char input >>= function
-  | Some c -> Lwt_result.return c
-  | None -> Lwt_result.fail (`Parse_error "premature end of input")
+  | Some c -> Async.Deferred.Result.return c
+  | None -> Async.Deferred.Result.fail (`Parse_error "premature end of input")
 
-let rec read_token input lexer c stack =
-  let open LwtrO in
+let rec read_token i lexer c stack =
   let open Csexp.Parser.Lexer in
   match feed lexer c with
-  | Lparen -> Lwt_result.return @@ Csexp.Parser.Stack.open_paren stack
-  | Rparen -> Lwt_result.return @@ Csexp.Parser.Stack.close_paren stack
+  | Lparen ->
+    Async.Deferred.Result.return @@ Csexp.Parser.Stack.open_paren stack
+  | Rparen ->
+    Async.Deferred.Result.return @@ Csexp.Parser.Stack.close_paren stack
   | Atom count -> (
-    try%lwt
-      let* atom = Lwt_io.read ~count input |> Lwt.map Result.return in
-      Lwt_result.return @@ Csexp.Parser.Stack.add_atom atom stack
-    with e -> Lwt_result.fail (`Read_error (Printexc.to_string e)) )
-  | Await -> (
-    read_char input >>= function
-    | Some c -> read_token input lexer c stack
-    | None -> Lwt_result.fail (`Parse_error "premature end of input") )
+    let str = String.make count '\x00' in
+    let f () =
+      let bytes = Bytes.unsafe_of_string str in
+      Async.Reader.really_read i bytes
+    in
+    let open Async in
+    Async.try_with f >>= function
+    | Result.Ok `Ok ->
+      Async.Deferred.Result.return (Csexp.Parser.Stack.add_atom str stack)
+    | Result.Ok (`Eof _) ->
+      Async.Deferred.Result.fail (`Parse_error "premature end of input")
+    | Result.Error e ->
+      Async.Deferred.Result.fail (`Read_error (Printexc.to_string e)) )
+  | Await ->
+    let* c = read_char_or_fail i in
+    read_token i lexer c stack
 
 let parse_sexp ?c input =
-  let open LwtrO in
+  let open Async.Deferred.Result in
   let lexer = Csexp.Parser.Lexer.create () in
   let* c =
     match c with
-    | Some c -> Lwt_result.return c
+    | Some c -> Async.Deferred.Result.return c
     | None -> read_char_or_fail input
   in
   let rec loop c stack =
     read_token input lexer c stack >>= function
-    | Sexp (s, Empty) -> Lwt_result.return s
+    | Sexp (s, Empty) -> Async.Deferred.Result.return s
     | stack ->
       let* c = read_char_or_fail input in
       loop c stack

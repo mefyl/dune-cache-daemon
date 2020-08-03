@@ -4,7 +4,6 @@ module Log = Dune_util.Log
 open Stdune
 open Utils
 open Cache.Messages
-open Result.O
 open Pp.O
 
 type error =
@@ -12,17 +11,13 @@ type error =
   | `Fatal of string
   ]
 
-module LwtR = struct
-  let ( let* ) = Lwt_result.Infix.( >>= )
-end
-
 type client =
   { cache : Cache.Local.t
   ; commits : Digest.t list array
   ; common_metadata : Sexp.t list
   ; fd : Lwt_unix.file_descr
-  ; input : Lwt_io.input_channel
-  ; output : Lwt_io.output_channel
+  ; input : Async.Reader.t
+  ; output : Async.Writer.t
   ; peer : Unix.sockaddr
   ; repositories : Cache.repository list
   ; version : version
@@ -51,6 +46,7 @@ let default_endpoint_file () = default_runtime_file "endpoint"
 let max_endpoint_size = 1024
 
 let check_endpoint_file ?(close = true) p =
+  let open Result.O in
   let p = Path.to_string p in
   match Result.try_with (fun () -> Unix.openfile p [ Unix.O_RDONLY ] 0o600) with
   | Result.Ok fd ->
@@ -70,7 +66,7 @@ let check_endpoint_file ?(close = true) p =
   | Result.Error e -> Result.Error e
 
 let send_sexp output sexp =
-  let open LwtR in
+  let open LwtrO in
   let* () =
     Lwt_io.write output @@ Csexp.to_string sexp |> Lwt.map Result.return
   in
@@ -113,9 +109,8 @@ type t =
   ; event_push : event option -> unit
   ; cache : Cache.Local.t
   ; distributed : (module Distributed.S)
-  ; distribution : (Cache.Key.t * Cache.Local.Metadata_file.t) Lwt_stream.t
-  ; distribute : (Cache.Key.t * Cache.Local.Metadata_file.t) option -> unit
-  ; distribution_barrier : Barrier.t
+  ; distribution_pipe :
+      (Cache.Key.t * Cache.Local.Metadata_file.t) Async.Pipe.Writer.t
   }
 
 exception Error of string
@@ -133,29 +128,21 @@ let make ?root ?(distribution = Distributed.disabled) ~config () =
   | Result.Error msg -> Lwt_result.fail (`Local_cache_error msg)
   | Result.Ok cache ->
     let events, event_push = Lwt_stream.create ()
-    and distributed = distribution cache
-    and distribution, distribute = Lwt_stream.create ()
-    and distribution_barrier = Barrier.make () in
-    let rec distribution_thread () =
-      let%lwt () = Barrier.wait distribution_barrier in
-      let%lwt was_stopped =
-        let%lwt empty = Lwt_stream.is_empty distribution in
-        if empty then
-          let () = info [ Pp.textf "done distributing" ] in
-          Lwt.return true
-        else
-          Lwt.return false
+    and distributed = distribution cache in
+    let distribution_pipe =
+      let rec f reader =
+        let open Async in
+        Async.Pipe.read reader >>= function
+        | `Ok (key, metadata) ->
+          let module D = (val distributed) in
+          let open Async in
+          D.distribute key metadata >>= fun res ->
+          log_error (Digest.to_string key) "distribute" res;
+          f reader
+        | `Eof -> return ()
       in
-      match%lwt Lwt_stream.get distribution with
-      | Some (key, metadata) ->
-        if was_stopped then info [ Pp.textf "start distributing" ];
-        let module D = (val distributed) in
-        let%lwt res = D.distribute key metadata in
-        log_error (Digest.to_string key) "distribute" res;
-        distribution_thread ()
-      | None -> Lwt.return ()
+      Async.Pipe.create_writer f
     in
-    Lwt.async distribution_thread;
     Lwt_result.return
       { root = Option.value root ~default:(Cache.Local.default_root ())
       ; socket = None
@@ -168,9 +155,7 @@ let make ?root ?(distribution = Distributed.disabled) ~config () =
       ; event_push
       ; cache
       ; distributed
-      ; distribution
-      ; distribute
-      ; distribution_barrier
+      ; distribution_pipe
       }
 
 let getsockname = function
@@ -225,28 +210,34 @@ let commits_index_key = "commits"
 
 let index_commits { distributed = (module Distributed); _ }
     ({ commits; repositories; _ } as client) =
-  let open LwtrO in
-  let f i (repository : Cache.repository) =
-    let commits = commits.(i)
-    and key = Digest.string repository.commit in
-    Distributed.index_add commits_index_key key commits
+  let open Async in
+  let* results =
+    let f i (repository : Cache.repository) =
+      let commits = commits.(i)
+      and key = Digest.string repository.commit in
+      Distributed.index_add commits_index_key key commits
+    in
+    Async.Deferred.List.mapi ~f repositories >>| Result.return
   in
-  let%lwt results = Lwt_list.mapi_p f repositories in
   let+ () =
     Result.List.all results
     |> Result.map ~f:(fun (_ : unit list) -> ())
     |> Result.map_error ~f:(fun e -> `Distribution_error e)
-    |> Lwt.return
+    |> Async.return
   in
   { client with commits = [||]; repositories = [] }
 
 let client_thread daemon client =
   try
     let handle_cmd (client : client) sexp () =
-      let open LwtR in
+      let open LwtrO in
       let* msg = outgoing_message_of_sexp client.version sexp |> Lwt.return in
       let promoted metadata { repository; key; _ } =
-        let () = daemon.distribute (Some (key, metadata)) in
+        let () =
+          Async.Pipe.write daemon.distribution_pipe (key, metadata)
+          |> (* no pusback *) ignore
+        in
+
         let register_commit repository =
           client.commits.(repository) <- key :: client.commits.(repository)
         in
@@ -254,15 +245,13 @@ let client_thread daemon client =
       in
       match msg with
       | Hint keys ->
-        let open LwtO in
         let module D = (val daemon.distributed) in
         let f k = D.prefetch k in
-        let prefetching () =
-          let* results = Lwt_list.map_s f keys in
-          List.iter ~f:(log_error (peer_name client.peer) "prefetching") results
-          |> Lwt.return
+        let _prefetching =
+          let open Async in
+          Async.Deferred.List.map ~f keys
+          >>| List.iter ~f:(log_error (peer_name client.peer) "prefetching")
         in
-        Lwt.async prefetching;
         Lwt_result.return client
       | Promote ({ duplication; repository; files; key; metadata } as promotion)
         ->
@@ -304,22 +293,23 @@ let client_thread daemon client =
       | SetCommonMetadata metadata ->
         Lwt_result.return { client with common_metadata = metadata }
       | SetRepos repositories ->
-        let prefetching () =
+        let _prefetching () =
           let module D = (val daemon.distributed) in
           let f (repository : Cache.repository) =
             D.index_prefetch commits_index_key (Digest.string repository.commit)
           in
-          let%lwt results = Lwt_list.map_p f repositories in
+          let open Async in
+          Async.Deferred.List.map ~f repositories >>= fun results ->
           match Result.List.all results with
-          | Result.Ok (_ : unit list) -> Lwt.return ()
+          | Result.Ok (_ : unit list) -> Async.return ()
           | Result.Error e ->
             info
               [ Pp.textf "error while prefetching index %s: %s"
                   commits_index_key e
               ];
-            Lwt.return ()
+            Async.return ()
         in
-        let () = Lwt.async prefetching in
+        ignore _prefetching;
         let* client = index_commits daemon client in
         let* cache =
           Cache.Local.with_repositories client.cache repositories
@@ -332,8 +322,7 @@ let client_thread daemon client =
     let input = client.input in
     let f () =
       let rec handle client =
-        let open Lwt_result.Infix in
-        let open LwtR in
+        let open Async_result in
         debug [ Pp.textf "%s: read next command" (peer_name client.peer) ];
         read_char input >>= function
         | None ->
@@ -474,7 +463,7 @@ let run ?(endpoint_f = ignore) ?endpoint ?(trim_period = 10 * 60)
       and output = Lwt_io.of_fd ~mode:Lwt_io.output fd in
       let* res =
         info [ Pp.textf "accept new client %s" (peer_name peer) ];
-        let open LwtR in
+        let open LwtrO in
         let* () =
           let version_message =
             Lang my_versions
@@ -574,7 +563,7 @@ let () = Logs.set_reporter (Logs.format_reporter ())
 
 let daemon ~root ?distribution ~config started =
   let dune_cache_daemon =
-    let open LwtR in
+    let open LwtrO in
     Path.mkdir_p root;
     let* daemon = make ~root ?distribution ~config () in
     (* Event blocks signals when waiting. Use a separate thread to catch
