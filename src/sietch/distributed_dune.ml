@@ -88,12 +88,15 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
               let ( >>= ) = Async.Deferred.( >>= ) in
               let buffer = Bytes.make 512 '\x00' in
               let reader =
-                let f writer =
+                let rec f writer =
                   (* FIXME: add some pushback, do not allocate for each buffer *)
                   Async.Reader.read input buffer >>= function
                   | `Ok len ->
-                    Async.Pipe.write writer
-                      (Bytes.sub_string buffer ~pos:0 ~len)
+                    let () =
+                      Async.Pipe.write_without_pushback writer
+                        (Bytes.sub_string buffer ~pos:0 ~len)
+                    in
+                    f writer
                   | `Eof -> Async.return @@ Async.Pipe.close writer
                 in
                 Async.Pipe.create_reader ~close_on_exception:true f
@@ -117,7 +120,9 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
           in
           if upload then
             let* status =
-              Async.Reader.with_file (Path.to_string path) ~f:insert
+              let path = Path.to_string path in
+              let () = debug [ Pp.textf "distribute %S" path ] in
+              Async.Reader.with_file path ~f:insert
             in
             Async.return
             @@ expect_status [ `Created; `OK ] `PUT (Path.to_string path) status
