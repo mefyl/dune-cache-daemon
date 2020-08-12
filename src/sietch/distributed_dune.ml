@@ -64,7 +64,7 @@ let get_file t target path local_path =
       [ Pp.textf "metadata file already present locally: %s"
           (Path.to_string local_path)
       ]
-    |> Lwt_result.return
+    |> Async.Deferred.Result.return
   else
     let* status, body = call t target `GET path in
     let* () = expect_status [ `OK ] `GET path status |> Async.return in
@@ -72,7 +72,7 @@ let get_file t target path local_path =
 
 let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
     =
-  let f =
+  let f () =
     let* () =
       match metadata.contents with
       | Files files ->
@@ -81,75 +81,88 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
           let query meth body =
             let path = "blocks/" ^ Digest.to_string digest in
             let* status, _body = call t digest meth ~body path in
-            Lwt_result.return status
+            Async.Deferred.Result.return status
           in
           let insert input =
             let body =
-              let read () =
-                let%lwt res = Lwt_io.read ~count:512 input in
-                if res <> "" then
-                  Some res |> Lwt.return
-                else
-                  None |> Lwt.return
+              let ( >>= ) = Async.Deferred.( >>= ) in
+              let buffer = Bytes.make 512 '\x00' in
+              let reader =
+                let f writer =
+                  (* FIXME: add some pushback, do not allocate for each buffer *)
+                  Async.Reader.read input buffer >>= function
+                  | `Ok len ->
+                    Async.Pipe.write writer
+                      (Bytes.sub_string buffer ~pos:0 ~len)
+                  | `Eof -> Async.return @@ Async.Pipe.close writer
+                in
+                Async.Pipe.create_reader ~close_on_exception:true f
               in
-              Lwt_stream.from read |> Cohttp_async.Body.of_stream
+              Cohttp_async.Body.of_pipe reader
             in
             query `PUT body
           in
           let stats = Path.stat path in
           let* upload =
             if stats.st_size < 4096 then
-              Lwt_result.return true
+              Async.Deferred.Result.return true
             else
               let* status = query `HEAD (Cohttp_async.Body.of_string "") in
               let* () =
-                Lwt.return
+                Async.return
                 @@ expect_status [ `OK; `No_content ] `HEAD
                      (Path.to_string path) status
               in
-              Lwt_result.return (status = `No_content)
+              Async.Deferred.Result.return (status = `No_content)
           in
           if upload then
             let* status =
-              Lwt_io.with_file ~mode:Lwt_io.input (Path.to_string path) insert
+              Async.Reader.with_file (Path.to_string path) ~f:insert
             in
-            Lwt.return
+            Async.return
             @@ expect_status [ `Created; `OK ] `PUT (Path.to_string path) status
           else
-            Lwt_result.return ()
+            Async.Deferred.Result.return ()
         in
-        let%lwt results = Lwt.all @@ List.map ~f:insert_file files in
-        let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
-        Lwt_result.return ()
-      | Value _ -> Lwt_result.fail "ignoring Jenga value"
+        let ( let* ) = Async.Deferred.( >>= ) in
+        let* results =
+          Async.Deferred.List.all @@ List.map ~f:insert_file files
+        in
+        let ( let* ) = Async.Deferred.Result.( >>= ) in
+        let* (_ : unit list) = results |> Result.List.all |> Async.return in
+        Async.Deferred.Result.return ()
+      | Value _ -> Async.Deferred.Result.fail "ignoring Jenga value"
     in
     put_contents t key
       ("blocks/" ^ Digest.to_string key)
       (Cache.Local.Metadata_file.to_string metadata)
   in
-  try%lwt f
-  with e -> failwith ("distribute fatal error: " ^ Printexc.to_string e)
+  let ( >>| ) = Async.Deferred.( >>| ) in
+  Async.try_with f >>| function
+  | Result.Ok v -> v
+  | Result.Error e ->
+    failwith ("distribute fatal error: " ^ Printexc.to_string e)
 
 let prefetch ({ cache; _ } as t) key =
-  try%lwt
+  let f () =
     let local_path = Local.metadata_path cache key in
     if Path.exists local_path then
       debug
         [ Pp.textf "metadata file already present locally: %s"
             (Path.to_string local_path)
         ]
-      |> Lwt_result.return
+      |> Async.Deferred.Result.return
     else
       let path = "blocks/" ^ Digest.to_string key in
       let* status, body = call t key `GET path in
       let* () =
-        expect_status [ `OK; `No_content ] `GET path status |> Lwt.return
+        expect_status [ `OK; `No_content ] `GET path status |> Async.return
       in
       if status = `No_content then
-        Lwt_result.return ()
+        Async.Deferred.Result.return ()
       else
         let* metadata =
-          Cache.Local.Metadata_file.of_string body |> Lwt.return
+          Cache.Local.Metadata_file.of_string body |> Async.return
         in
         match metadata.contents with
         | Files files ->
@@ -158,44 +171,61 @@ let prefetch ({ cache; _ } as t) key =
               ("blocks/" ^ Digest.to_string digest)
               (Local.file_path cache digest)
           in
-          let%lwt results = Lwt.all @@ List.map ~f:fetch files in
-          let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
+          let ( let* ) = Async.Deferred.( >>= ) in
+          let* results = Async.Deferred.List.all @@ List.map ~f:fetch files in
+          let ( let* ) = Async.Deferred.Result.( >>= ) in
+          let* (_ : unit list) = results |> Result.List.all |> Async.return in
           write_file cache local_path false body
         | Value h ->
           let () =
             debug [ Pp.textf "skipping Jenga value: %s" (Digest.to_string h) ]
           in
-          Lwt_result.return ()
-  with e -> failwith ("prefetch fatal error: " ^ Printexc.to_string e)
+          Async.Deferred.Result.return ()
+  in
+  let ( >>| ) = Async.Deferred.( >>| ) in
+  Async.try_with f >>| function
+  | Result.Ok v -> v
+  | Result.Error e -> failwith ("prefetch fatal error: " ^ Printexc.to_string e)
 
 let index_path name key =
   String.concat ~sep:"/" [ "index"; name; Digest.to_string key ]
 
 let index_add t name key keys =
-  try%lwt
+  let f () =
     put_contents t key (index_path name key)
       (String.concat ~sep:"\n" (List.map ~f:Digest.to_string keys))
-  with e -> failwith ("index_add fatal error: " ^ Printexc.to_string e)
+  in
+  let ( >>| ) = Async.Deferred.( >>| ) in
+  Async.try_with f >>| function
+  | Result.Ok v -> v
+  | Result.Error e -> failwith ("index_add fatal error: " ^ Printexc.to_string e)
 
 let index_prefetch t name key =
-  try%lwt
+  let f () =
     let path = index_path name key in
     let* status, body = call t key `GET path in
     let* () =
-      expect_status [ `OK; `Not_found ] `GET path status |> Lwt.return
+      expect_status [ `OK; `Not_found ] `GET path status |> Async.return
     in
     if status = `OK then
       let keys =
         String.split ~on:'\n' body
         |> List.map ~f:(fun d -> Digest.from_hex d |> Option.value_exn)
       in
-      let%lwt results = Lwt_list.map_s (prefetch t) keys in
-      let* (_ : unit list) = Result.List.all results |> Lwt.return in
-      Lwt_result.return ()
+      let ( let* ) = Async.Deferred.( >>= ) in
+      let* results = Async.Deferred.List.map ~f:(prefetch t) keys in
+      let ( let* ) = Async.Deferred.Result.( >>= ) in
+      let* (_ : unit list) = Result.List.all results |> Async.return in
+      Async.Deferred.Result.return ()
     else
-      Lwt_result.return ()
-  with e ->
-    Lwt_result.fail ("index_prefetch fatal error: " ^ Printexc.to_string e)
+      Async.Deferred.Result.return ()
+  in
+  let ( >>= ) = Async.Deferred.( >>= ) in
+  Async.try_with f >>= function
+  | Result.Ok v -> Async.return v
+  | Result.Error e ->
+    Async.Deferred.Result.fail
+      ("index_prefetch fatal error: " ^ Printexc.to_string e)
 
 let make config local =
   ( module struct
