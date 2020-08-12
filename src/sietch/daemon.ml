@@ -294,9 +294,10 @@ let client_thread daemon client =
       | SetCommonMetadata metadata ->
         Async.Deferred.Result.return { client with common_metadata = metadata }
       | SetRepos repositories ->
-        let _prefetching () =
+        let _prefetching =
           let module D = (val daemon.distributed) in
           let f (repository : Cache.repository) =
+            info [ Pp.textf "prefetch commit %S" repository.commit ];
             D.index_prefetch commits_index_key (Digest.string repository.commit)
           in
           let open Async in
@@ -310,7 +311,6 @@ let client_thread daemon client =
               ];
             Async.return ()
         in
-        ignore _prefetching;
         let* client = index_commits daemon client in
         let* cache =
           Cache.Local.with_repositories client.cache repositories
