@@ -218,7 +218,7 @@ let index_prefetch t name key =
     if status = `OK then
       let keys =
         String.split ~on:'\n' body
-        |> List.map ~f:(fun d -> Digest.from_hex d |> Option.value_exn)
+        |> List.filter_map ~f:(fun d -> Digest.from_hex d)
       in
       let ( let* ) = Async.Deferred.( >>= ) in
       let* results = Async.Deferred.List.map ~f:(prefetch t) keys in
