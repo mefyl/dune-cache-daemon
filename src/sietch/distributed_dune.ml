@@ -26,7 +26,10 @@ let call t target m ?body path =
   let* uri = find_target t target |> Async.return in
   let uri = Uri.with_uri ~path:(Option.some @@ Uri.path uri ^ path) uri
   and headers =
-    Cohttp.Header.of_list [ ("Content-Type", "application/octet-stream") ]
+    Cohttp.Header.of_list
+      [ ("Content-Type", "application/octet-stream")
+      ; ("Transfer-Encoding", "chunked")
+      ]
   in
   let* response, body =
     let f () = Cohttp_async.Client.call m ~headers ?body uri in
