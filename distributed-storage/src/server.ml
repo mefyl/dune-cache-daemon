@@ -70,9 +70,23 @@ module Blocks = struct
       error reqd `Internal_server_error "unable to read block %S"
         (Digest.to_string hash)
 
-  let read { root; ranges } reqd hash f =
+  let file_path ?path root hash =
+    let root =
+      match path with
+      | Some path ->
+        let path = Path.relative root path in
+        let () =
+          try Unix.mkdir (Path.to_string path) 0o700
+          with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+        in
+        path
+      | None -> root
+    in
+    Path.relative root (Digest.to_string hash)
+
+  let read ?path { root; ranges } reqd hash f =
     let () = check_range ranges hash in
-    let path = Path.relative root (Digest.to_string hash) in
+    let path = file_path ?path root hash in
     let read =
       let* () = Lwt.pause () in
       let stats = Path.stat path in
@@ -99,7 +113,7 @@ module Blocks = struct
     in
     read t reqd hash f
 
-  let get t reqd hash =
+  let get ?path t reqd hash =
     let f path stats headers =
       let f stats input =
         let file_size = stats.Unix.st_size in
@@ -140,7 +154,7 @@ module Blocks = struct
       Lwt_io.with_file ~flags:[ Unix.O_RDONLY ] ~mode:Lwt_io.input
         (Path.to_string path) (f stats)
     in
-    read t reqd hash f
+    read ?path t reqd hash f
 
   type disk_buffer =
     { buffer : Bytes.t
@@ -166,9 +180,9 @@ module Blocks = struct
       in
       loop 0
 
-  let put { root; ranges } reqd hash executable =
+  let put ?path { root; ranges } reqd hash executable =
     let () = check_range ranges hash in
-    let path = Path.relative root (Digest.to_string hash) in
+    let path = file_path ?path root hash in
     let put =
       let f output =
         let wait, resolve = Lwt.wait () in
@@ -256,12 +270,14 @@ let request_handler t sockaddr reqd =
         | `PUT ->
           let executable = Headers.get headers "X-executable" = Some "1" in
           Blocks.put t reqd hash executable )
-      | [ ""; "index"; index; hash ] -> (
-        let hash = Digest.string (index ^ hash) in
-        match meth with
-        | `HEAD -> raise (Method_not_allowed meth)
-        | `GET -> Blocks.get t reqd hash
-        | `PUT -> Blocks.put t reqd hash false )
+      | [ ""; "index"; path; hash ] -> (
+        match Digest.from_hex hash with
+        | None -> error reqd `Bad_request "invalid hash: %S" hash
+        | Some hash -> (
+          match meth with
+          | `HEAD -> raise (Method_not_allowed meth)
+          | `GET -> Blocks.get ~path t reqd hash
+          | `PUT -> Blocks.put ~path t reqd hash false ) )
       | path ->
         error reqd `Bad_request "no such endpoint: %S"
           (String.concat ~sep:"/" path)

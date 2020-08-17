@@ -21,8 +21,7 @@ let find_target t target =
          (Digest.to_string target))
 
 let call t target m ?body path =
-  let ( >>= ) = Async.( >>= )
-  and ( >>| ) = Async.( >>| ) in
+  let ( >>= ) = Async.( >>= ) in
   let* uri = find_target t target |> Async.return in
   let uri = Uri.with_uri ~path:(Option.some @@ Uri.path uri ^ path) uri
   and headers =
@@ -32,7 +31,12 @@ let call t target m ?body path =
       ]
   in
   let* response, body =
-    let f () = Cohttp_async.Client.call m ~headers ?body uri in
+    let f () =
+      let ( let* ) = Async.( >>= ) in
+      let* response, body = Cohttp_async.Client.call m ~headers ?body uri in
+      let* body = Cohttp_async.Body.to_string body in
+      Async.return (response, body)
+    in
     Async.try_with f >>= function
     | Result.Ok v -> Async.Deferred.Result.return v
     | Result.Error (Unix.Unix_error (e, f, a)) ->
@@ -41,10 +45,8 @@ let call t target m ?body path =
            (Unix.error_message e) f a)
     | Result.Error e ->
       Async.Deferred.Result.fail
-        (Printf.sprintf "unexpected error during HTTP request %s"
-           (Printexc.to_string e))
+        (Printf.sprintf "error during HTTP request %s" (Printexc.to_string e))
   in
-  let* body = Cohttp_async.Body.to_string body >>| Result.return in
   Async.Deferred.Result.return (Cohttp.Response.status response, body)
 
 let expect_status expected m path = function
