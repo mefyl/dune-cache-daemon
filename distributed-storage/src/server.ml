@@ -90,7 +90,6 @@ module Blocks = struct
     let read =
       let* () = Lwt.pause () in
       let stats = Path.stat path in
-      let* () = Logs_lwt.info (fun m -> m "> %s" (status_to_string `OK)) in
       let headers =
         [ ( "X-executable"
           , if stats.st_perm land 0o100 <> 0 then
@@ -109,6 +108,7 @@ module Blocks = struct
         let headers = Headers.of_list @@ (("Content-length", "0") :: headers) in
         Response.create ~headers `OK
       in
+      let* () = Logs_lwt.info (fun m -> m "> %s" (status_to_string `OK)) in
       Lwt.return @@ Reqd.respond_with_string reqd response ""
     in
     read t reqd hash f
@@ -127,9 +127,9 @@ module Blocks = struct
           Response.create ~headers `OK
         in
         let body = Reqd.respond_with_streaming reqd response in
-        let size = 512 * 1024 in
-        let buffer = Bytes.make size '\x00' in
-        let bigstring = Bigstringaf.create size in
+        let size = 16 * 1024 in
+        let buffer = Bytes.make size '\x00'
+        and bigstring = Bigstringaf.create size in
         let rec loop () =
           Lwt_io.read_into input buffer 0 size >>= function
           | 0 -> Lwt.return ()
@@ -138,10 +138,14 @@ module Blocks = struct
               Bigstringaf.unsafe_blit_from_bytes buffer ~src_off:0 bigstring
                 ~dst_off:0 ~len:read
             in
-            let () = Body.schedule_bigstring body bigstring
-            and wait, resolve = Lwt.wait () in
-            let () = Body.flush body (Lwt.wakeup resolve) in
-            let* () = wait in
+            let* () =
+              let () =
+                Body.schedule_bigstring body
+                  (Bigstringaf.sub bigstring ~off:0 ~len:read)
+              and wait, resolve = Lwt.wait () in
+              let () = Body.flush body (Lwt.wakeup resolve) in
+              wait
+            in
             loop ()
         in
         let* () = loop () in
