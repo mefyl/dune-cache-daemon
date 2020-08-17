@@ -74,7 +74,7 @@ let write output s =
 let send_sexp output sexp =
   let f () = write output @@ Csexp.to_string sexp in
   let ( >>= ) = Async.( >>= ) in
-  Async.try_with f >>= function
+  Async.try_with ~extract_exn:true f >>= function
   | Result.Ok v -> Async.Deferred.return v
   | Result.Error (Unix.Unix_error (e, f, _)) ->
     Async.Deferred.Result.fail
@@ -191,7 +191,7 @@ let client_handle peer version output = function
 
 let protect ~f ~finally =
   let open Async in
-  try_with f >>= function
+  try_with ~extract_exn:true f >>= function
   | Result.Ok v -> finally () >>| fun () -> v
   | Result.Error e -> finally () >>| fun () -> raise e
 
@@ -354,7 +354,8 @@ let client_thread daemon client =
       Async.Pipe.write daemon.push_event (Client_left client.socket)
     in
     let ( >>| ) = Async.( >>| ) in
-    Async.try_with (fun () -> protect ~f ~finally) >>| function
+    Async.try_with ~extract_exn:true (fun () -> protect ~f ~finally)
+    >>| function
     | Result.Ok v -> v
     | Result.Error (Unix.Unix_error (Unix.EBADF, _, _)) ->
       let () = info [ Pp.textf "%s: ended" (peer_name client.peer) ] in

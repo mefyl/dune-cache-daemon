@@ -37,7 +37,7 @@ let call t target m ?body path =
       let* body = Cohttp_async.Body.to_string body in
       Async.return (response, body)
     in
-    Async.try_with f >>= function
+    Async.try_with ~extract_exn:true f >>= function
     | Result.Ok v -> Async.Deferred.Result.return v
     | Result.Error (Unix.Unix_error (e, f, a)) ->
       Async.Deferred.Result.fail
@@ -148,7 +148,7 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
       (Cache.Local.Metadata_file.to_string metadata)
   in
   let ( >>| ) = Async.Deferred.( >>| ) in
-  Async.try_with f >>| function
+  Async.try_with ~extract_exn:true f >>| function
   | Result.Ok v -> v
   | Result.Error e ->
     failwith ("distribute fatal error: " ^ Printexc.to_string e)
@@ -193,7 +193,7 @@ let prefetch ({ cache; _ } as t) key =
           Async.Deferred.Result.return ()
   in
   let ( >>| ) = Async.Deferred.( >>| ) in
-  Async.try_with f >>| function
+  Async.try_with ~extract_exn:true f >>| function
   | Result.Ok v -> v
   | Result.Error e -> failwith ("prefetch fatal error: " ^ Printexc.to_string e)
 
@@ -206,7 +206,7 @@ let index_add t name key keys =
       (String.concat ~sep:"\n" (List.map ~f:Digest.to_string keys))
   in
   let ( >>| ) = Async.Deferred.( >>| ) in
-  Async.try_with f >>| function
+  Async.try_with ~extract_exn:true f >>| function
   | Result.Ok v -> v
   | Result.Error e -> failwith ("index_add fatal error: " ^ Printexc.to_string e)
 
@@ -231,7 +231,7 @@ let index_prefetch t name key =
       Async.Deferred.Result.return ()
   in
   let ( >>= ) = Async.Deferred.( >>= ) in
-  Async.try_with f >>= function
+  Async.try_with ~extract_exn:true f >>= function
   | Result.Ok v -> Async.return v
   | Result.Error e ->
     Async.Deferred.Result.fail

@@ -46,7 +46,7 @@ let retry ?message ?(count = 100) f =
 let read_char input =
   let f () = Async.Reader.read_char input in
   let open Async in
-  Async.try_with f >>= function
+  Async.try_with ~extract_exn:true f >>= function
   | Result.Ok (`Ok c) -> Deferred.Result.return @@ Some c
   | Result.Ok `Eof -> Deferred.Result.return None
   | Result.Error End_of_file -> Deferred.Result.return None
@@ -72,7 +72,7 @@ let rec read_token i lexer c stack =
       Async.Reader.really_read i bytes
     in
     let open Async in
-    Async.try_with f >>= function
+    Async.try_with ~extract_exn:true f >>= function
     | Result.Ok `Ok ->
       Async.Deferred.Result.return (Csexp.Parser.Stack.add_atom str stack)
     | Result.Ok (`Eof _) ->
@@ -103,7 +103,7 @@ let parse_sexp ?c input =
 let mkdir p =
   let f () = Async.Unix.mkdir ~perm:0o700 p in
   let ( >>| ) = Async.Deferred.( >>| ) in
-  Async.try_with f >>| function
+  Async.try_with ~extract_exn:true f >>| function
   | Result.Ok () -> ()
   | Result.Error (Unix.Unix_error (Unix.EEXIST, _, _)) -> ()
   | Result.Error e -> raise e
@@ -134,7 +134,7 @@ let write_file local path executable contents =
     Async.Unix.rename ~src:path_tmp ~dst:path
   in
   let ( >>= ) = Async.Deferred.( >>= ) in
-  Async.try_with f >>= function
+  Async.try_with ~extract_exn:true f >>= function
   | Result.Ok () -> Async.Deferred.Result.return ()
   | Result.Error (Unix.Unix_error (Unix.EACCES, _, _)) ->
     (* If the file exists with no write permissions, it is being pulled as part
