@@ -20,20 +20,20 @@ let find_target t target =
       (Printf.sprintf "no target backend for address %s"
          (Digest.to_string target))
 
-let call t target m ?body path =
+let call t target m ?(headers = []) ?body path =
   let ( >>= ) = Async.( >>= ) in
   let* uri = find_target t target |> Async.return in
   let uri = Uri.with_uri ~path:(Option.some @@ Uri.path uri ^ path) uri
   and headers =
     Cohttp.Header.of_list
-      [ ("Content-Type", "application/octet-stream")
-      ; ("Transfer-Encoding", "chunked")
-      ]
+    @@ (("Content-Type", "application/octet-stream") :: headers)
   in
   let* response, body =
     let f () =
       let ( let* ) = Async.( >>= ) in
-      let* response, body = Cohttp_async.Client.call m ~headers ?body uri in
+      let* response, body =
+        Cohttp_async.Client.call m ~chunked:true ~headers ?body uri
+      in
       let* body = Cohttp_async.Body.to_string body in
       Async.return (response, body)
     in
@@ -83,32 +83,16 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
       | Files files ->
         let insert_file { Cache.File.digest; _ } =
           let path = Local.file_path cache digest in
-          let query meth body =
+          let query ?(headers = []) meth body =
             let path = "blocks/" ^ Digest.to_string digest in
-            let* status, _body = call t digest meth ~body path in
+            let* status, _body = call t digest meth ~headers ~body path in
             Async.Deferred.Result.return status
           in
-          let insert input =
-            let body =
-              let ( >>= ) = Async.Deferred.( >>= ) in
-              let buffer = Bytes.make 512 '\x00' in
-              let reader =
-                let rec f writer =
-                  (* FIXME: add some pushback, do not allocate for each buffer *)
-                  Async.Reader.read input buffer >>= function
-                  | `Ok len ->
-                    let () =
-                      Async.Pipe.write_without_pushback writer
-                        (Bytes.sub_string buffer ~pos:0 ~len)
-                    in
-                    f writer
-                  | `Eof -> Async.return @@ Async.Pipe.close writer
-                in
-                Async.Pipe.create_reader ~close_on_exception:true f
-              in
-              Cohttp_async.Body.of_pipe reader
-            in
-            query `PUT body
+          let insert stats input =
+            let body = Cohttp_async.Body.of_pipe @@ Async.Reader.pipe input in
+            query
+              ~headers:[ ("Content-Length", Int.to_string stats.Unix.st_size) ]
+              `PUT body
           in
           let stats = Path.stat path in
           let* upload =
@@ -127,7 +111,7 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
             let* status =
               let path = Path.to_string path in
               let () = debug [ Pp.textf "distribute %S" path ] in
-              Async.Reader.with_file path ~f:insert
+              Async.Reader.with_file path ~f:(insert stats)
             in
             Async.return
             @@ expect_status [ `Created; `OK ] `PUT (Path.to_string path) status
@@ -223,7 +207,10 @@ let index_prefetch t name key =
         |> List.filter_map ~f:(fun d -> Digest.from_hex d)
       in
       let ( let* ) = Async.Deferred.( >>= ) in
-      let* results = Async.Deferred.List.map ~f:(prefetch t) keys in
+      let* results =
+        Async.Deferred.List.map ~how:(`Max_concurrent_jobs 8) ~f:(prefetch t)
+          keys
+      in
       let ( let* ) = Async.Deferred.Result.( >>= ) in
       let* (_ : unit list) = Result.List.all results |> Async.return in
       Async.Deferred.Result.return ()

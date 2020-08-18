@@ -35,7 +35,7 @@
   lwt_ppx
   (ocamlformat
    (and
-    (= 0.14.3)
+    (= 0.15.0)
     :dev))
   sexplib
   uri))

@@ -21,7 +21,6 @@ let status_to_string = function
       (Status.default_reason_phrase status)
 
 let response reqd status =
-  let* () = Logs_lwt.info (fun m -> m "> %s" (status_to_string status)) in
   let headers = Headers.of_list [ ("Content-length", "0") ] in
   let response = Response.create ~headers status in
   Lwt.return @@ Reqd.respond_with_string reqd response ""
@@ -211,13 +210,13 @@ module Blocks = struct
               else
                 blit b blit_from blit_end
           in
-          Lwt.async (fun () ->
-              (* let* () = Logs_lwt.debug (fun m -> m " ... read %i bytes" len)
-                 in *)
-              blit b off (off + len))
+          Lwt.async (fun () -> blit b off (off + len))
         and on_eof b () =
           let f () =
             let* _ = write b output in
+            let* () =
+              Logs_lwt.info (fun m -> m "> %s" (status_to_string `Created))
+            in
             let* () = response reqd `Created in
             Lwt.return @@ Lwt.wakeup resolve ()
           in
