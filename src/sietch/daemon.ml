@@ -233,8 +233,8 @@ let client_thread daemon client =
       let* msg = outgoing_message_of_sexp client.version sexp |> Async.return in
       let promoted metadata { repository; key; _ } =
         let () =
-          Async.Pipe.write daemon.distribution_pipe (key, metadata)
-          |> (* no pushback *) ignore
+          Async.Pipe.write_without_pushback daemon.distribution_pipe
+            (key, metadata)
         in
         let register_commit repository =
           client.commits.(repository) <- key :: client.commits.(repository)
