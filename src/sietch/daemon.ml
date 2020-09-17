@@ -277,14 +277,16 @@ let client_thread daemon client =
         Lwt_result.return client
       | Promoted ({ key; _ } as promotion) ->
         let* metadata =
+          let path = Cache.Local.metadata_path client.cache key in
           let* sexp =
             try
-              Cache.Local.metadata_path client.cache key
-              |> Io.read_file |> Csexp.parse_string
+              Io.read_file path |> Csexp.parse_string
               |> Result.map_error ~f:(fun (_, e) -> `Parse_error e)
               |> Lwt.return
-            with Sys_error _ ->
-              Lwt_result.fail @@ `Read_error "metadata filed disappeared"
+            with Sys_error e ->
+              let path = Path.to_string path in
+              let msg = sprintf "error while reading metadata file %s: %s" path e in
+              Lwt_result.fail @@ `Read_error msg
           in
           Cache.Local.Metadata_file.of_sexp sexp
           |> Result.map_error ~f:(fun e -> `Parse_error e)
