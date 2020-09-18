@@ -21,24 +21,28 @@ let find_target t target =
          (Digest.to_string target))
 
 let call t target m ?body path =
+  let ( >>= ) = Async.( >>= )
+  and ( >>| ) = Async.( >>| ) in
   let* uri = find_target t target |> Async.return in
   let uri = Uri.with_uri ~path:(Option.some @@ Uri.path uri ^ path) uri
   and headers =
     Cohttp.Header.of_list [ ("Content-Type", "application/octet-stream") ]
   in
   let* response, body =
-    let f () =
-      Cohttp_async.Client.call m ~headers ?body uri |> Lwt.map Result.ok
-    in
+    let f () = Cohttp_async.Client.call m ~headers ?body uri in
     Async.try_with f >>= function
     | Result.Ok v -> Async.Deferred.Result.return v
     | Result.Error (Unix.Unix_error (e, f, a)) ->
       Async.Deferred.Result.fail
         (Printf.sprintf "error during HTTP request %s: %s %s"
            (Unix.error_message e) f a)
+    | Result.Error e ->
+      Async.Deferred.Result.fail
+        (Printf.sprintf "unexpected error during HTTP request %s"
+           (Printexc.to_string e))
   in
-  let* body = Cohttp_lwt.Body.to_string body |> Lwt.map Result.ok in
-  Lwt_result.return (Cohttp.Response.status response, body)
+  let* body = Cohttp_async.Body.to_string body >>| Result.return in
+  Async.Deferred.Result.return (Cohttp.Response.status response, body)
 
 let expect_status expected m path = function
   | effective when List.exists ~f:(( = ) effective) expected -> Result.Ok ()
@@ -50,9 +54,9 @@ let expect_status expected m path = function
          path)
 
 let put_contents t target path contents =
-  let body = Lwt_stream.of_list [ contents ] |> Cohttp_lwt.Body.of_stream in
+  let body = Cohttp_async.Body.of_string contents in
   let* status, _body = call t target `PUT ~body path in
-  Lwt.return @@ expect_status [ `Created; `OK ] `PUT path status
+  Async.return @@ expect_status [ `Created; `OK ] `PUT path status
 
 let get_file t target path local_path =
   if Path.exists local_path then
@@ -63,7 +67,7 @@ let get_file t target path local_path =
     |> Lwt_result.return
   else
     let* status, body = call t target `GET path in
-    let* () = expect_status [ `OK ] `GET path status |> Lwt.return in
+    let* () = expect_status [ `OK ] `GET path status |> Async.return in
     write_file t.cache local_path true body
 
 let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
@@ -88,7 +92,7 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
                 else
                   None |> Lwt.return
               in
-              Lwt_stream.from read |> Cohttp_lwt.Body.of_stream
+              Lwt_stream.from read |> Cohttp_async.Body.of_stream
             in
             query `PUT body
           in
@@ -97,7 +101,7 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
             if stats.st_size < 4096 then
               Lwt_result.return true
             else
-              let* status = query `HEAD (Cohttp_lwt.Body.of_string "") in
+              let* status = query `HEAD (Cohttp_async.Body.of_string "") in
               let* () =
                 Lwt.return
                 @@ expect_status [ `OK; `No_content ] `HEAD

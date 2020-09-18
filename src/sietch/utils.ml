@@ -5,9 +5,13 @@ module Csexp = struct
   include Csexp_external.Make (Sexp)
 end
 
-let ( let* ) = Async.Deferred.Result.( >>= )
+let ( >>= ) = Async.Deferred.Result.( >>= )
 
-let ( let+ ) = Async.Deferred.Result.( >>| )
+let ( >>| ) = Async.Deferred.Result.( >>| )
+
+let ( let* ) = ( >>= )
+
+let ( let+ ) = ( >>| )
 
 let int_of_string ?where s =
   match Int.of_string s with
