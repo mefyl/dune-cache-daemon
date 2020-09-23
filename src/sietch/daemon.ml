@@ -272,9 +272,10 @@ let client_thread daemon client =
               |> Async.return
             with Sys_error e ->
               let path = Path.to_string path in
-              let msg = sprintf "error while reading metadata file %s: %s" path e in
-              Async.Deferred.Result.fail
-              @@ `Read_error msg
+              let msg =
+                sprintf "error while reading metadata file %s: %s" path e
+              in
+              Async.Deferred.Result.fail @@ `Read_error msg
           in
           Cache.Local.Metadata_file.of_sexp sexp
           |> Result.map_error ~f:(fun e -> `Parse_error e)
@@ -297,8 +298,14 @@ let client_thread daemon client =
         let _prefetching =
           let module D = (val daemon.distributed) in
           let f (repository : Cache.repository) =
-            info [ Pp.textf "prefetch commit %S" repository.commit ];
-            D.index_prefetch commits_index_key (Digest.string repository.commit)
+            let hash = Digest.string repository.commit in
+            let () =
+              info
+                [ Pp.textf "prefetch commit %S (%S)" repository.commit
+                    (Digest.to_string hash)
+                ]
+            in
+            D.index_prefetch commits_index_key hash
           in
           let open Async in
           Async.Deferred.List.map ~f repositories >>= fun results ->

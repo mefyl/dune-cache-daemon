@@ -30,15 +30,19 @@ let error reqd status =
     let* () =
       Logs_lwt.info (fun m -> m "> %s: %s" (status_to_string status) reason)
     in
-    let contents = Format.sprintf "{\"reason\": %S}" reason in
-    let headers =
-      Headers.of_list
-        [ ("Content-type", "application/json")
-        ; ("Content-length", Int.to_string (String.length contents))
-        ]
-    in
-    let response = Response.create ~headers status in
-    Lwt.return @@ Reqd.respond_with_string reqd response contents
+    if status = `No_content then
+      let response = Response.create ~headers:Headers.empty status in
+      Lwt.return @@ Reqd.respond_with_string reqd response ""
+    else
+      let contents = Format.sprintf "{\"reason\": %S}" reason in
+      let headers =
+        Headers.of_list
+          [ ("Content-type", "application/json")
+          ; ("Content-length", Int.to_string (String.length contents))
+          ]
+      in
+      let response = Response.create ~headers status in
+      Lwt.return @@ Reqd.respond_with_string reqd response contents
   in
   Format.ksprintf (error reqd status)
 
@@ -95,6 +99,7 @@ module Blocks = struct
               "1"
             else
               "0" )
+        ; ("X-dune-hash", Digest.to_string hash)
         ]
       in
       f path stats headers
