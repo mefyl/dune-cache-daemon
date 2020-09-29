@@ -205,9 +205,8 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
         in
         let ( let* ) = Async.Deferred.( >>= ) in
         let* results =
-          Async.Deferred.List.map ~how:(`Max_concurrent_jobs 1) ~f:insert_file
+          Async.Deferred.List.map ~how:(`Max_concurrent_jobs 8) ~f:insert_file
             files
-          (* Async.Deferred.List.all @@ List.map ~f:insert_file files *)
         in
         let ( let* ) = Async.Deferred.Result.( >>= ) in
         let* (_ : unit list) = results |> Result.List.all |> Async.return in
@@ -293,7 +292,7 @@ let index_prefetch t name key =
     let path = index_path name key in
     let* status, body = call t key `GET path in
     let* () =
-      expect_status [ `OK; `Not_found ] `GET path status |> Async.return
+      expect_status [ `OK; `No_content ] `GET path status |> Async.return
     in
     if Poly.( = ) status `OK then
       let keys =
@@ -302,7 +301,7 @@ let index_prefetch t name key =
       in
       let ( let* ) = Async.Deferred.( >>= ) in
       let* results =
-        Async.Deferred.List.map ~how:(`Max_concurrent_jobs 1) ~f:(prefetch t)
+        Async.Deferred.List.map ~how:(`Max_concurrent_jobs 8) ~f:(prefetch t)
           keys
       in
       let ( let* ) = Async.Deferred.Result.( >>= ) in
