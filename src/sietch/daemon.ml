@@ -140,8 +140,10 @@ let make ?root ?(distribution = Distributed.disabled) ~config () =
         | `Ok (key, metadata) ->
           let module D = (val distributed) in
           let open Async in
-          D.distribute key metadata >>= fun res ->
-          log_error (Digest.to_string key) "distribute" res;
+          (* FIXME: use an async monitor or something *)
+          ignore
+            ( D.distribute key metadata >>| fun res ->
+              log_error (Digest.to_string key) "distribute" res );
           f reader
         | `Eof -> return ()
       in
