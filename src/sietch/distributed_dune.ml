@@ -2,8 +2,6 @@ open Stdune
 open Utils
 module Sexp = Sexplib.Sexp
 
-let ( let* ) = Lwt_result.( >>= )
-
 type t =
   { cache : Local.t
   ; config : Config.t
@@ -22,22 +20,34 @@ let find_target t target =
       (Printf.sprintf "no target backend for address %s"
          (Digest.to_string target))
 
-let call t target m ?body path =
-  let* uri = find_target t target |> Lwt.return in
+let call t target m ?(headers = []) ?body path =
+  let ( >>= ) = Async.( >>= ) in
+  let* uri = find_target t target |> Async.return in
   let uri = Uri.with_uri ~path:(Option.some @@ Uri.path uri ^ path) uri
   and headers =
-    Cohttp.Header.of_list [ ("Content-Type", "application/octet-stream") ]
+    Cohttp.Header.of_list
+    @@ (("Content-Type", "application/octet-stream") :: headers)
   in
   let* response, body =
-    try%lwt
-      Cohttp_lwt_unix.Client.call m ~headers ?body uri |> Lwt.map Result.ok
-    with Unix.Unix_error (e, f, a) ->
-      Lwt_result.fail
+    let f () =
+      let ( let* ) = Async.( >>= ) in
+      let* response, body =
+        Cohttp_async.Client.call m ~chunked:true ~headers ?body uri
+      in
+      let* body = Cohttp_async.Body.to_string body in
+      Async.return (response, body)
+    in
+    Async.try_with ~extract_exn:true f >>= function
+    | Result.Ok v -> Async.Deferred.Result.return v
+    | Result.Error (Unix.Unix_error (e, f, a)) ->
+      Async.Deferred.Result.fail
         (Printf.sprintf "error during HTTP request %s: %s %s"
            (Unix.error_message e) f a)
+    | Result.Error e ->
+      Async.Deferred.Result.fail
+        (Printf.sprintf "error during HTTP request %s" (Printexc.to_string e))
   in
-  let* body = Cohttp_lwt.Body.to_string body |> Lwt.map Result.ok in
-  Lwt_result.return (Cohttp.Response.status response, body)
+  Async.Deferred.Result.return (Cohttp.Response.status response, body)
 
 let expect_status expected m path = function
   | effective when List.exists ~f:(( = ) effective) expected -> Result.Ok ()
@@ -49,9 +59,9 @@ let expect_status expected m path = function
          path)
 
 let put_contents t target path contents =
-  let body = Lwt_stream.of_list [ contents ] |> Cohttp_lwt.Body.of_stream in
+  let body = Cohttp_async.Body.of_string contents in
   let* status, _body = call t target `PUT ~body path in
-  Lwt.return @@ expect_status [ `Created; `OK ] `PUT path status
+  Async.return @@ expect_status [ `Created; `OK ] `PUT path status
 
 let get_file t target path local_path =
   if Path.exists local_path then
@@ -59,92 +69,94 @@ let get_file t target path local_path =
       [ Pp.textf "metadata file already present locally: %s"
           (Path.to_string local_path)
       ]
-    |> Lwt_result.return
+    |> Async.Deferred.Result.return
   else
     let* status, body = call t target `GET path in
-    let* () = expect_status [ `OK ] `GET path status |> Lwt.return in
+    let* () = expect_status [ `OK ] `GET path status |> Async.return in
     write_file t.cache local_path true body
 
 let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
     =
-  let f =
+  let f () =
     let* () =
       match metadata.contents with
       | Files files ->
         let insert_file { Cache.File.digest; _ } =
           let path = Local.file_path cache digest in
-          let query meth body =
+          let query ?(headers = []) meth body =
             let path = "blocks/" ^ Digest.to_string digest in
-            let* status, _body = call t digest meth ~body path in
-            Lwt_result.return status
+            let* status, _body = call t digest meth ~headers ~body path in
+            Async.Deferred.Result.return status
           in
-          let insert input =
-            let body =
-              let read () =
-                let%lwt res = Lwt_io.read ~count:512 input in
-                if res <> "" then
-                  Some res |> Lwt.return
-                else
-                  None |> Lwt.return
-              in
-              Lwt_stream.from read |> Cohttp_lwt.Body.of_stream
-            in
-            query `PUT body
+          let insert stats input =
+            let body = Cohttp_async.Body.of_pipe @@ Async.Reader.pipe input in
+            query
+              ~headers:[ ("Content-Length", Int.to_string stats.Unix.st_size) ]
+              `PUT body
           in
           let stats = Path.stat path in
           let* upload =
             if stats.st_size < 4096 then
-              Lwt_result.return true
+              Async.Deferred.Result.return true
             else
-              let* status = query `HEAD (Cohttp_lwt.Body.of_string "") in
+              let* status = query `HEAD (Cohttp_async.Body.of_string "") in
               let* () =
-                Lwt.return
+                Async.return
                 @@ expect_status [ `OK; `No_content ] `HEAD
                      (Path.to_string path) status
               in
-              Lwt_result.return (status = `No_content)
+              Async.Deferred.Result.return (status = `No_content)
           in
           if upload then
             let* status =
-              Lwt_io.with_file ~mode:Lwt_io.input (Path.to_string path) insert
+              let path = Path.to_string path in
+              let () = debug [ Pp.textf "distribute %S" path ] in
+              Async.Reader.with_file path ~f:(insert stats)
             in
-            Lwt.return
+            Async.return
             @@ expect_status [ `Created; `OK ] `PUT (Path.to_string path) status
           else
-            Lwt_result.return ()
+            Async.Deferred.Result.return ()
         in
-        let%lwt results = Lwt.all @@ List.map ~f:insert_file files in
-        let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
-        Lwt_result.return ()
-      | Value _ -> Lwt_result.fail "ignoring Jenga value"
+        let ( let* ) = Async.Deferred.( >>= ) in
+        let* results =
+          Async.Deferred.List.all @@ List.map ~f:insert_file files
+        in
+        let ( let* ) = Async.Deferred.Result.( >>= ) in
+        let* (_ : unit list) = results |> Result.List.all |> Async.return in
+        Async.Deferred.Result.return ()
+      | Value _ -> Async.Deferred.Result.fail "ignoring Jenga value"
     in
     put_contents t key
       ("blocks/" ^ Digest.to_string key)
       (Cache.Local.Metadata_file.to_string metadata)
   in
-  try%lwt f
-  with e -> failwith ("distribute fatal error: " ^ Printexc.to_string e)
+  let ( >>| ) = Async.Deferred.( >>| ) in
+  Async.try_with ~extract_exn:true f >>| function
+  | Result.Ok v -> v
+  | Result.Error e ->
+    failwith ("distribute fatal error: " ^ Printexc.to_string e)
 
 let prefetch ({ cache; _ } as t) key =
-  try%lwt
+  let f () =
     let local_path = Local.metadata_path cache key in
     if Path.exists local_path then
       debug
         [ Pp.textf "metadata file already present locally: %s"
             (Path.to_string local_path)
         ]
-      |> Lwt_result.return
+      |> Async.Deferred.Result.return
     else
       let path = "blocks/" ^ Digest.to_string key in
       let* status, body = call t key `GET path in
       let* () =
-        expect_status [ `OK; `No_content ] `GET path status |> Lwt.return
+        expect_status [ `OK; `No_content ] `GET path status |> Async.return
       in
       if status = `No_content then
-        Lwt_result.return ()
+        Async.Deferred.Result.return ()
       else
         let* metadata =
-          Cache.Local.Metadata_file.of_string body |> Lwt.return
+          Cache.Local.Metadata_file.of_string body |> Async.return
         in
         match metadata.contents with
         | Files files ->
@@ -153,44 +165,64 @@ let prefetch ({ cache; _ } as t) key =
               ("blocks/" ^ Digest.to_string digest)
               (Local.file_path cache digest)
           in
-          let%lwt results = Lwt.all @@ List.map ~f:fetch files in
-          let* (_ : unit list) = results |> Result.List.all |> Lwt.return in
+          let ( let* ) = Async.Deferred.( >>= ) in
+          let* results = Async.Deferred.List.all @@ List.map ~f:fetch files in
+          let ( let* ) = Async.Deferred.Result.( >>= ) in
+          let* (_ : unit list) = results |> Result.List.all |> Async.return in
           write_file cache local_path false body
         | Value h ->
           let () =
             debug [ Pp.textf "skipping Jenga value: %s" (Digest.to_string h) ]
           in
-          Lwt_result.return ()
-  with e -> failwith ("prefetch fatal error: " ^ Printexc.to_string e)
+          Async.Deferred.Result.return ()
+  in
+  let ( >>| ) = Async.Deferred.( >>| ) in
+  Async.try_with ~extract_exn:true f >>| function
+  | Result.Ok v -> v
+  | Result.Error e -> failwith ("prefetch fatal error: " ^ Printexc.to_string e)
 
 let index_path name key =
   String.concat ~sep:"/" [ "index"; name; Digest.to_string key ]
 
 let index_add t name key keys =
-  try%lwt
+  let f () =
     put_contents t key (index_path name key)
       (String.concat ~sep:"\n" (List.map ~f:Digest.to_string keys))
-  with e -> failwith ("index_add fatal error: " ^ Printexc.to_string e)
+  in
+  let ( >>| ) = Async.Deferred.( >>| ) in
+  Async.try_with ~extract_exn:true f >>| function
+  | Result.Ok v -> v
+  | Result.Error e -> failwith ("index_add fatal error: " ^ Printexc.to_string e)
 
 let index_prefetch t name key =
-  try%lwt
+  let f () =
     let path = index_path name key in
     let* status, body = call t key `GET path in
     let* () =
-      expect_status [ `OK; `Not_found ] `GET path status |> Lwt.return
+      expect_status [ `OK; `Not_found ] `GET path status |> Async.return
     in
     if status = `OK then
       let keys =
         String.split ~on:'\n' body
-        |> List.map ~f:(fun d -> Digest.from_hex d |> Option.value_exn)
+        |> List.filter_map ~f:(fun d -> Digest.from_hex d)
       in
-      let%lwt results = Lwt_list.map_s (prefetch t) keys in
-      let* (_ : unit list) = Result.List.all results |> Lwt.return in
-      Lwt_result.return ()
+      let ( let* ) = Async.Deferred.( >>= ) in
+      let* results =
+        Async.Deferred.List.map ~how:(`Max_concurrent_jobs 8) ~f:(prefetch t)
+          keys
+      in
+      let ( let* ) = Async.Deferred.Result.( >>= ) in
+      let* (_ : unit list) = Result.List.all results |> Async.return in
+      Async.Deferred.Result.return ()
     else
-      Lwt_result.return ()
-  with e ->
-    Lwt_result.fail ("index_prefetch fatal error: " ^ Printexc.to_string e)
+      Async.Deferred.Result.return ()
+  in
+  let ( >>= ) = Async.Deferred.( >>= ) in
+  Async.try_with ~extract_exn:true f >>= function
+  | Result.Ok v -> Async.return v
+  | Result.Error e ->
+    Async.Deferred.Result.fail
+      ("index_prefetch fatal error: " ^ Printexc.to_string e)
 
 let make config local =
   ( module struct

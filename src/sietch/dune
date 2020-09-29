@@ -2,7 +2,7 @@
 
 (library
  (name dune_cache_daemon)
- (libraries cohttp cohttp-lwt-unix csexp dune-private-libs.cache
+ (libraries async cohttp cohttp-async csexp dune-private-libs.cache
    dune-private-libs.stdune logs lwt lwt.unix sexplib uri)
  (synopsis "Dune distributed binary artifacts cache")
  (preprocess

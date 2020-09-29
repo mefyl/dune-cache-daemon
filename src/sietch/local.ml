@@ -2,19 +2,20 @@ open Stdune
 
 type t =
   { cache : Cache.Local.t
-  ; fd_pool : unit Lwt_pool.t
+  ; throttle : unit Async.Throttle.t
   ; tmp : Path.t
   }
 
 let make cache =
   { cache
-  ; fd_pool = Lwt_pool.create 128 (fun () -> Lwt.return ())
+  ; throttle =
+      Async.Throttle.create ~continue_on_error:true ~max_concurrent_jobs:128
   ; tmp = Cache.Local.tmp_path cache "dune-cache-daemon"
   }
 
 let tmp { tmp; _ } = tmp
 
-let throttle_fd { fd_pool; _ } f = Lwt_pool.use fd_pool f
+let throttle_fd { throttle; _ } f = Async.Throttle.enqueue throttle f
 
 let file_path { cache; _ } = Cache.Local.file_path cache
 

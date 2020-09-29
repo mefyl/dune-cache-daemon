@@ -21,7 +21,6 @@ let status_to_string = function
       (Status.default_reason_phrase status)
 
 let response reqd status =
-  let* () = Logs_lwt.info (fun m -> m "> %s" (status_to_string status)) in
   let headers = Headers.of_list [ ("Content-length", "0") ] in
   let response = Response.create ~headers status in
   Lwt.return @@ Reqd.respond_with_string reqd response ""
@@ -70,13 +69,26 @@ module Blocks = struct
       error reqd `Internal_server_error "unable to read block %S"
         (Digest.to_string hash)
 
-  let read { root; ranges } reqd hash f =
+  let file_path ?path root hash =
+    let root =
+      match path with
+      | Some path ->
+        let path = Path.relative root path in
+        let () =
+          try Unix.mkdir (Path.to_string path) 0o700
+          with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+        in
+        path
+      | None -> root
+    in
+    Path.relative root (Digest.to_string hash)
+
+  let read ?path { root; ranges } reqd hash f =
     let () = check_range ranges hash in
-    let path = Path.relative root (Digest.to_string hash) in
+    let path = file_path ?path root hash in
     let read =
       let* () = Lwt.pause () in
       let stats = Path.stat path in
-      let* () = Logs_lwt.info (fun m -> m "> %s" (status_to_string `OK)) in
       let headers =
         [ ( "X-executable"
           , if stats.st_perm land 0o100 <> 0 then
@@ -95,11 +107,12 @@ module Blocks = struct
         let headers = Headers.of_list @@ (("Content-length", "0") :: headers) in
         Response.create ~headers `OK
       in
+      let* () = Logs_lwt.info (fun m -> m "> %s" (status_to_string `OK)) in
       Lwt.return @@ Reqd.respond_with_string reqd response ""
     in
     read t reqd hash f
 
-  let get t reqd hash =
+  let get ?path t reqd hash =
     let f path stats headers =
       let f stats input =
         let file_size = stats.Unix.st_size in
@@ -113,9 +126,9 @@ module Blocks = struct
           Response.create ~headers `OK
         in
         let body = Reqd.respond_with_streaming reqd response in
-        let size = 512 * 1024 in
-        let buffer = Bytes.make size '\x00' in
-        let bigstring = Bigstringaf.create size in
+        let size = 16 * 1024 in
+        let buffer = Bytes.make size '\x00'
+        and bigstring = Bigstringaf.create size in
         let rec loop () =
           Lwt_io.read_into input buffer 0 size >>= function
           | 0 -> Lwt.return ()
@@ -124,10 +137,14 @@ module Blocks = struct
               Bigstringaf.unsafe_blit_from_bytes buffer ~src_off:0 bigstring
                 ~dst_off:0 ~len:read
             in
-            let () = Body.schedule_bigstring body bigstring
-            and wait, resolve = Lwt.wait () in
-            let () = Body.flush body (Lwt.wakeup resolve) in
-            let* () = wait in
+            let* () =
+              let () =
+                Body.schedule_bigstring body
+                  (Bigstringaf.sub bigstring ~off:0 ~len:read)
+              and wait, resolve = Lwt.wait () in
+              let () = Body.flush body (Lwt.wakeup resolve) in
+              wait
+            in
             loop ()
         in
         let* () = loop () in
@@ -140,7 +157,7 @@ module Blocks = struct
       Lwt_io.with_file ~flags:[ Unix.O_RDONLY ] ~mode:Lwt_io.input
         (Path.to_string path) (f stats)
     in
-    read t reqd hash f
+    read ?path t reqd hash f
 
   type disk_buffer =
     { buffer : Bytes.t
@@ -166,9 +183,9 @@ module Blocks = struct
       in
       loop 0
 
-  let put { root; ranges } reqd hash executable =
+  let put ?path { root; ranges } reqd hash executable =
     let () = check_range ranges hash in
-    let path = Path.relative root (Digest.to_string hash) in
+    let path = file_path ?path root hash in
     let put =
       let f output =
         let wait, resolve = Lwt.wait () in
@@ -193,13 +210,13 @@ module Blocks = struct
               else
                 blit b blit_from blit_end
           in
-          Lwt.async (fun () ->
-              (* let* () = Logs_lwt.debug (fun m -> m " ... read %i bytes" len)
-                 in *)
-              blit b off (off + len))
+          Lwt.async (fun () -> blit b off (off + len))
         and on_eof b () =
           let f () =
             let* _ = write b output in
+            let* () =
+              Logs_lwt.info (fun m -> m "> %s" (status_to_string `Created))
+            in
             let* () = response reqd `Created in
             Lwt.return @@ Lwt.wakeup resolve ()
           in
@@ -256,12 +273,14 @@ let request_handler t sockaddr reqd =
         | `PUT ->
           let executable = Headers.get headers "X-executable" = Some "1" in
           Blocks.put t reqd hash executable )
-      | [ ""; "index"; index; hash ] -> (
-        let hash = Digest.string (index ^ hash) in
-        match meth with
-        | `HEAD -> raise (Method_not_allowed meth)
-        | `GET -> Blocks.get t reqd hash
-        | `PUT -> Blocks.put t reqd hash false )
+      | [ ""; "index"; path; hash ] -> (
+        match Digest.from_hex hash with
+        | None -> error reqd `Bad_request "invalid hash: %S" hash
+        | Some hash -> (
+          match meth with
+          | `HEAD -> raise (Method_not_allowed meth)
+          | `GET -> Blocks.get ~path t reqd hash
+          | `PUT -> Blocks.put ~path t reqd hash false ) )
       | path ->
         error reqd `Bad_request "no such endpoint: %S"
           (String.concat ~sep:"/" path)

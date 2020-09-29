@@ -17,7 +17,7 @@ val make :
   -> ?distribution:(Cache.Local.t -> (module Distributed.S))
   -> config:config
   -> unit
-  -> (t, error) Lwt_result.t
+  -> (t, error) Async.Deferred.Result.t
 
 val default_endpoint_file : unit -> Path.t
 
@@ -32,7 +32,7 @@ val run :
   -> ?trim_period:int
   -> ?trim_size:int64
   -> t
-  -> unit Lwt.t
+  -> (unit, error) Async.Deferred.Result.t
 
 val endpoint : t -> string option
 

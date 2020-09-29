@@ -3,72 +3,15 @@ open Stdune
 
 module Csexp = struct
   include Csexp_external.Make (Sexp)
-
-  module Lwt = struct
-    module Input = struct
-      type t =
-        { channel : Lwt_io.input_channel
-        ; mutable peeked : char option
-        }
-
-      let make channel = { channel; peeked = None }
-
-      module Monad = Lwt
-
-      let ( let* ) = Lwt_result.Infix.( >>= )
-
-      (* Not exactly efficient memory-wise, but we're dealing with small
-         buffers. *)
-
-      let rec _read_string t count =
-        match t.peeked with
-        | Some c ->
-          t.peeked <- None;
-          let* s = _read_string t (count - 1) in
-          Lwt_result.return @@ String.make 1 c ^ s
-        | None -> (
-          try%lwt Lwt_io.read ~count t.channel |> Lwt.map Result.return
-          with e -> Lwt_result.fail (Printexc.to_string e) )
-
-      let rec read_string t count =
-        let* res = _read_string t count in
-        match String.length res with
-        | l when l = count -> Lwt_result.return res
-        | 0 -> Lwt_result.fail "premature end of input"
-        | l ->
-          let* rest = read_string t (count - l) in
-          Lwt_result.return (res ^ rest)
-
-      let read_char t =
-        match t.peeked with
-        | Some c ->
-          t.peeked <- None;
-          Lwt_result.return c
-        | None ->
-          let* s = read_string t 1 in
-          Lwt_result.return s.[0]
-
-      let peek_char t =
-        match t.peeked with
-        | Some c -> Lwt_result.return (Some c)
-        | None ->
-          let* s = _read_string t 1 in
-          if String.length s = 0 then
-            Lwt_result.return None
-          else
-            let c = Some s.[0] in
-            t.peeked <- c;
-            Lwt_result.return c
-    end
-
-    module Parser = struct
-      include Make_parser (Input)
-
-      let parse input =
-        parse input |> Lwt_result.map_err (fun e -> `Parse_error e)
-    end
-  end
 end
+
+let ( >>= ) = Async.Deferred.Result.( >>= )
+
+let ( >>| ) = Async.Deferred.Result.( >>| )
+
+let ( let* ) = ( >>= )
+
+let ( let+ ) = ( >>| )
 
 let int_of_string ?where s =
   match Int.of_string s with
@@ -100,85 +43,74 @@ let retry ?message ?(count = 100) f =
   in
   loop 0
 
-module LwtO = struct
-  include Lwt.Infix
+let read_char input =
+  let f () = Async.Reader.read_char input in
+  let open Async in
+  Async.try_with ~extract_exn:true f >>= function
+  | Result.Ok (`Ok c) -> Deferred.Result.return @@ Some c
+  | Result.Ok `Eof -> Deferred.Result.return None
+  | Result.Error End_of_file -> Deferred.Result.return None
+  | Result.Error e -> Deferred.Result.fail (`Read_error (Printexc.to_string e))
 
-  let ( let* ) = ( >>= )
+let read_char_or_fail input =
+  let open Async.Deferred.Result in
+  read_char input >>= function
+  | Some c -> Async.Deferred.Result.return c
+  | None -> Async.Deferred.Result.fail (`Parse_error "premature end of input")
 
-  let ( let+ ) = ( >|= )
-end
+let rec read_token i lexer c stack =
+  let open Csexp.Parser.Lexer in
+  match feed lexer c with
+  | Lparen ->
+    Async.Deferred.Result.return @@ Csexp.Parser.Stack.open_paren stack
+  | Rparen ->
+    Async.Deferred.Result.return @@ Csexp.Parser.Stack.close_paren stack
+  | Atom count -> (
+    let str = String.make count '\x00' in
+    let f () =
+      let bytes = Bytes.unsafe_of_string str in
+      Async.Reader.really_read i bytes
+    in
+    let open Async in
+    Async.try_with ~extract_exn:true f >>= function
+    | Result.Ok `Ok ->
+      Async.Deferred.Result.return (Csexp.Parser.Stack.add_atom str stack)
+    | Result.Ok (`Eof _) ->
+      Async.Deferred.Result.fail (`Parse_error "premature end of input")
+    | Result.Error e ->
+      Async.Deferred.Result.fail (`Read_error (Printexc.to_string e)) )
+  | Await ->
+    let* c = read_char_or_fail i in
+    read_token i lexer c stack
 
-module LwtrO = struct
-  include Lwt_result.Infix
-
-  let ( let* ) = ( >>= )
-
-  let ( let+ ) = ( >|= )
-end
-
-(** A barrier that let thread throughs after it has been opened for some
-    duration. Enables to postpone low priority operations until main operations
-    have been silent for some time. *)
-module Barrier = struct
-  open LwtO
-
-  type t =
-    { mutable open_ : bool
-    ; mutable time : float
-    ; mutable promise : unit Lwt.t
-    ; mutable resolve : unit Lwt.u
-    ; threshold : float
-    }
-
-  let make ?(threshold = 0.1) () =
-    let promise, resolve = Lwt.wait () in
-    { open_ = true; time = Unix.gettimeofday (); promise; resolve; threshold }
-
-  let open_ = function
-    | { open_ = true; _ } -> ()
-    | { resolve; _ } as b ->
-      let p, r = Lwt.wait () in
-      b.open_ <- true;
-      b.time <- Unix.gettimeofday ();
-      b.promise <- p;
-      b.resolve <- r;
-      Lwt.wakeup resolve ()
-
-  let close b = b.open_ <- false
-
-  let rec wait = function
-    | { open_ = true; time; _ } as b ->
-      let now = Unix.gettimeofday () in
-      let elapsed = now -. time in
-      if elapsed > b.threshold then
-        Lwt.return ()
-      else
-        let%lwt () = Lwt_unix.sleep (b.threshold -. elapsed) in
-        wait b
-    | { promise; _ } as b ->
-      let* () = promise in
-      wait b
-
-  let use b f =
-    close b;
-    match%lwt f () with
-    | e ->
-      open_ b;
-      Lwt.return e
-    | exception e ->
-      open_ b;
-      raise e
-end
+let parse_sexp ?c input =
+  let open Async.Deferred.Result in
+  let lexer = Csexp.Parser.Lexer.create () in
+  let* c =
+    match c with
+    | Some c -> Async.Deferred.Result.return c
+    | None -> read_char_or_fail input
+  in
+  let rec loop c stack =
+    read_token input lexer c stack >>= function
+    | Sexp (s, Empty) -> Async.Deferred.Result.return s
+    | stack ->
+      let* c = read_char_or_fail input in
+      loop c stack
+  in
+  loop c Csexp.Parser.Stack.Empty
 
 let mkdir p =
-  try%lwt Lwt_unix.mkdir p 0o700
-  with Unix.Unix_error (Unix.EEXIST, _, _) -> Lwt.return ()
+  let f () = Async.Unix.mkdir ~perm:0o700 p in
+  let ( >>| ) = Async.Deferred.( >>| ) in
+  Async.try_with ~extract_exn:true f >>| function
+  | Result.Ok () -> ()
+  | Result.Error (Unix.Unix_error (Unix.EEXIST, _, _)) -> ()
+  | Result.Error e -> raise e
 
 (** Write file in an atomic manner. *)
 let write_file local path executable contents =
-  try%lwt
-    Lwt.map Result.ok
-    @@
+  let f () =
     let dir = path |> Path.parent_exn |> Path.to_string
     and path_tmp =
       path |> Path.basename |> Path.relative (Local.tmp local) |> Path.to_string
@@ -189,19 +121,26 @@ let write_file local path executable contents =
       else
         0o400
     in
-    let%lwt () =
+    let ( let* ) = Async.Deferred.( >>= )
+    and ( and* ) = Async.Deferred.both in
+    let* () =
       let write () =
-        let%lwt output = Lwt_io.open_file ~perm ~mode:Lwt_io.output path_tmp in
-        let%lwt () = Lwt_io.write output contents in
-        Lwt_io.close output
+        let* output = Async.Writer.open_file ~perm path_tmp in
+        let () = Async.Writer.write output contents in
+        Async.Writer.close output
       in
       Local.throttle_fd local write
-    and () = mkdir dir in
-    Lwt_unix.rename path_tmp path
-  with
-  | Unix.Unix_error (Unix.EACCES, _, _) ->
+    and* () = mkdir dir in
+    Async.Unix.rename ~src:path_tmp ~dst:path
+  in
+  let ( >>= ) = Async.Deferred.( >>= ) in
+  Async.try_with ~extract_exn:true f >>= function
+  | Result.Ok () -> Async.Deferred.Result.return ()
+  | Result.Error (Unix.Unix_error (Unix.EACCES, _, _)) ->
     (* If the file exists with no write permissions, it is being pulled as part
        of another hinting. *)
-    Lwt_result.return ()
-  | Unix.Unix_error (e, f, a) ->
-    Lwt_result.fail (Printf.sprintf "%s: %s %s" (Unix.error_message e) f a)
+    Async.Deferred.Result.return ()
+  | Result.Error (Unix.Unix_error (e, f, a)) ->
+    Async.Deferred.Result.fail
+      (Printf.sprintf "%s: %s %s" (Unix.error_message e) f a)
+  | Result.Error e -> raise e
