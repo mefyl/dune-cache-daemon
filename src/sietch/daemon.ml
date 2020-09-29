@@ -101,6 +101,48 @@ type event =
   | New_client of [ `Active ] socket * Async.Socket.Address.Unix.t
   | Client_left of [ `Active ] socket
 
+module Low_priority : sig
+  type t
+
+  val create : unit -> t
+
+  val with_high_priority :
+    f:(unit -> 'a Async.Deferred.t) -> t -> 'a Async.Deferred.t
+
+  val wait : t -> unit Async.Deferred.t
+end = struct
+  type t = int Async.Mvar.Read_write.t
+
+  let create = Async.Mvar.create
+
+  let take t =
+    match Async.Mvar.peek t with
+    | None -> Async.Mvar.set t 1
+    | Some v -> Async.Mvar.set t (v + 1)
+
+  let release t =
+    match Async.Mvar.peek t with
+    | None -> failwith "decrementing a null semaphore"
+    | Some 1 -> Async.Mvar.take_now t |> ignore
+    | Some v -> Async.Mvar.set t (v - 1)
+
+  let with_high_priority ~f t =
+    let ( >>= ) = Async.( >>= ) in
+    let () = take t in
+    Async.try_with f >>= function
+    | Result.Ok v ->
+      let () = release t in
+      Async.return v
+    | Result.Error exn ->
+      let () = release t in
+      raise exn
+
+  let wait t =
+    match Async.Mvar.peek t with
+    | None -> Async.return ()
+    | Some _ -> Async.Mvar.taken t
+end
+
 type t =
   { root : Path.t
   ; mutable socket : [ `Passive ] socket option
@@ -113,8 +155,8 @@ type t =
   ; push_event : event Async.Pipe.Writer.t
   ; cache : Cache.Local.t
   ; distributed : (module Distributed.S)
-  ; distribution_pipe :
-      (Cache.Key.t * Cache.Local.Metadata_file.t) Async.Pipe.Writer.t
+  ; distribution_pipe : unit Async.Throttle.t
+  ; distribution_barrier : Low_priority.t
   }
 
 exception Error of string
@@ -133,22 +175,6 @@ let make ?root ?(distribution = Distributed.disabled) ~config () =
   | Result.Ok cache ->
     let events, push_event = Async.Pipe.create ()
     and distributed = distribution cache in
-    let distribution_pipe =
-      let rec f reader =
-        let open Async in
-        Async.Pipe.read reader >>= function
-        | `Ok (key, metadata) ->
-          let module D = (val distributed) in
-          let open Async in
-          (* FIXME: use an async monitor or something *)
-          ignore
-            ( D.distribute key metadata >>| fun res ->
-              log_error (Digest.to_string key) "distribute" res );
-          f reader
-        | `Eof -> return ()
-      in
-      Async.Pipe.create_writer f
-    in
     Async.Deferred.Result.return
       { root = Option.value root ~default:(Cache.Local.default_root ())
       ; socket = None
@@ -161,7 +187,9 @@ let make ?root ?(distribution = Distributed.disabled) ~config () =
       ; push_event
       ; cache
       ; distributed
-      ; distribution_pipe
+      ; distribution_pipe =
+          Async.Throttle.create ~continue_on_error:true ~max_concurrent_jobs:32
+      ; distribution_barrier = Low_priority.create ()
       }
 
 let getsockname = function
@@ -235,8 +263,15 @@ let client_thread daemon client =
       let* msg = outgoing_message_of_sexp client.version sexp |> Async.return in
       let promoted metadata { repository; key; _ } =
         let () =
-          Async.Pipe.write_without_pushback daemon.distribution_pipe
-            (key, metadata)
+          let f () =
+            let open Async in
+            Low_priority.wait daemon.distribution_barrier >>= fun () ->
+            let module D = (val daemon.distributed) in
+            D.distribute key metadata >>| fun res ->
+            log_error (Digest.to_string key) "distribute" res
+          in
+          Async.don't_wait_for
+          @@ Async.Throttle.enqueue daemon.distribution_pipe f
         in
         let register_commit repository =
           client.commits.(repository) <- key :: client.commits.(repository)
@@ -297,28 +332,32 @@ let client_thread daemon client =
       | SetCommonMetadata metadata ->
         Async.Deferred.Result.return { client with common_metadata = metadata }
       | SetRepos repositories ->
-        let _prefetching =
-          let module D = (val daemon.distributed) in
-          let f (repository : Cache.repository) =
-            let hash = Digest.string repository.commit in
-            let () =
-              info
-                [ Pp.textf "prefetch commit %S (%S)" repository.commit
-                    (Digest.to_string hash)
-                ]
+        let () =
+          let f () =
+            let module D = (val daemon.distributed) in
+            let f (repository : Cache.repository) =
+              let hash = Digest.string repository.commit in
+              let () =
+                info
+                  [ Pp.textf "prefetch commit %S (%S)" repository.commit
+                      (Digest.to_string hash)
+                  ]
+              in
+              D.index_prefetch commits_index_key hash
             in
-            D.index_prefetch commits_index_key hash
+            let open Async in
+            Async.Deferred.List.map ~f repositories >>= fun results ->
+            match Result.List.all results with
+            | Result.Ok (_ : unit list) -> Async.return ()
+            | Result.Error e ->
+              info
+                [ Pp.textf "error while prefetching index %s: %s"
+                    commits_index_key e
+                ];
+              Async.return ()
           in
-          let open Async in
-          Async.Deferred.List.map ~f repositories >>= fun results ->
-          match Result.List.all results with
-          | Result.Ok (_ : unit list) -> Async.return ()
-          | Result.Error e ->
-            info
-              [ Pp.textf "error while prefetching index %s: %s"
-                  commits_index_key e
-              ];
-            Async.return ()
+          Async.don't_wait_for
+          @@ Low_priority.with_high_priority ~f daemon.distribution_barrier
         in
         let* client = index_commits daemon client in
         let* cache =
@@ -344,16 +383,26 @@ let client_thread daemon client =
           (* Skip toplevel newlines, for easy netcat interaction *)
           (handle [@tailcall]) client
         | Some c ->
-          let* cmd = parse_sexp ~c input in
-          debug
-            [ Pp.box ~indent:2
-              @@ Pp.textf "%s: received command" (peer_name client.peer)
-                 ++ Pp.space
-                 ++ Pp.hbox (Pp.text @@ Stdune.Sexp.to_string cmd)
-            ];
-          let* client = handle_cmd client cmd in
+          let f () =
+            let* cmd = parse_sexp ~c input in
+            debug
+              [ Pp.box ~indent:2
+                @@ Pp.textf "%s: received command" (peer_name client.peer)
+                   ++ Pp.space
+                   ++ Pp.hbox (Pp.text @@ Stdune.Sexp.to_string cmd)
+              ];
+            let* client = handle_cmd client cmd in
+            if data_available input then
+              (handle [@tailcall]) client
+            else
+              Async.Deferred.Result.return client
+          in
+          let* client =
+            Low_priority.with_high_priority ~f daemon.distribution_barrier
+          in
           (handle [@tailcall]) client
       in
+
       handle client
     and finally () =
       debug [ Pp.textf "%s: cleanup" (peer_name client.peer) ];

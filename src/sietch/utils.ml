@@ -52,6 +52,9 @@ let read_char input =
   | Result.Error End_of_file -> Deferred.Result.return None
   | Result.Error e -> Deferred.Result.fail (`Read_error (Printexc.to_string e))
 
+let data_available input =
+  String.length (Async.Reader.peek_available input ~len:1) > 0
+
 let read_char_or_fail input =
   let open Async.Deferred.Result in
   read_char input >>= function
