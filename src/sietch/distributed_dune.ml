@@ -224,8 +224,9 @@ let prefetch ({ cache; _ } as t) key =
         ]
       |> Async.Deferred.Result.return
     else
-      let path = "blocks/" ^ Digest.to_string key in
-      let () = debug [ Pp.textf "fetch metadata %s" path ] in
+      let hash = Digest.to_string key in
+      let path = "blocks/" ^ hash in
+      let () = debug [ Pp.textf "fetch metadata %s" hash ] in
       let* status, body = call t key `GET path in
       let* () =
         expect_status [ `OK; `No_content ] `GET path status |> Async.return
