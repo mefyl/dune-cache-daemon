@@ -71,6 +71,8 @@ let client t target =
   | Some client -> Async.Deferred.Result.return client
   | None -> connect t uri
 
+let mutex = ref (Async.Ivar.create_full (Result.Ok ()))
+
 let call t target meth ?(headers = []) ?body path =
   let* client = client t target in
   let uri =
@@ -87,41 +89,49 @@ let call t target meth ?(headers = []) ?body path =
       , Cohttp_async.Body.empty
       , Cohttp.Transfer.Fixed 0L )
   in
+  let lock = !mutex
+  and unlock = Async.Ivar.create () in
+  let () = mutex := unlock in
   let* () =
     let request = Cohttp.Request.make ~meth ~encoding ~headers uri in
     Async.Pipe.write client.requests (request, body)
     |> Async.Deferred.map ~f:Result.return
   in
+  let* () = Async.Ivar.read lock in
   let ( >>= ) = Async.( >>= ) in
   Async.Pipe.read client.responses >>= function
-  | `Eof -> Async.Deferred.Result.fail "error during HTTP request: no response"
-  | `Ok (response, body) ->
-    let drain () =
-      Cohttp_async.Body.drain body |> Async.Deferred.map ~f:Result.return
+  | `Eof ->
+    let () =
+      Caml.Format.eprintf "FATAL EMPTY %s\n%!" (Digest.to_string target)
     in
-    let* () =
-      let headers = Cohttp.Response.headers response in
-      match Cohttp.Header.get headers "X-dune-hash" with
-      | Some hash ->
-        let* hash = digest_of_str hash in
-        if Poly.( = ) (Digest.compare hash target) Ordering.Eq then
-          Async.Deferred.Result.return ()
-        else
-          let* () = drain () in
-          Async.Deferred.Result.failf
-            "invalid hash for artifact: expected %s, effective %s"
-            (Digest.to_string target) (Digest.to_string hash)
-      | None ->
-        if Poly.( = ) meth `GET then
-          let* () = drain () in
-          Async.Deferred.Result.fail "missing X-dune-hash header"
-        else
-          Async.Deferred.Result.return ()
-    in
-    let* body =
-      Cohttp_async.Body.to_string body |> Async.Deferred.map ~f:Result.return
-    in
-    Async.Deferred.Result.return (Cohttp.Response.status response, body)
+    let () = Async.Ivar.fill unlock (Result.Ok ()) in
+    Async.Deferred.Result.fail "error during HTTP request: no response"
+  | `Ok (response, body) -> (
+    (let drain () =
+       Cohttp_async.Body.drain body |> Async.Deferred.map ~f:Result.return
+     in
+     let () = Async.Ivar.fill unlock (Result.Ok ()) in
+     let* () =
+       let headers = Cohttp.Response.headers response in
+       match Cohttp.Header.get headers "X-dune-hash" with
+       | Some hash ->
+         let* hash = digest_of_str hash in
+         if Poly.( = ) (Digest.compare hash target) Ordering.Eq then
+           Async.Deferred.Result.return ()
+         else
+           let* () = drain () in
+           Async.Deferred.Result.failf
+             "invalid hash for artifact: expected %s, effective %s"
+             (Digest.to_string target) (Digest.to_string hash)
+       | None -> Async.Deferred.Result.return ()
+     in
+     let* body =
+       Cohttp_async.Body.to_string body |> Async.Deferred.map ~f:Result.return
+     in
+     Async.Deferred.Result.return (Cohttp.Response.status response, body))
+    >>= function
+    | Result.Ok _ as res -> Async.return res
+    | Result.Error _e as error -> Async.return error )
 
 let expect_status expected m path = function
   | effective when List.exists ~f:(Poly.( = ) effective) expected ->
