@@ -1,0 +1,155 @@
+opam-version: "2.0"
+version: "0.1.0"
+synopsis: "Dune distributed cache daemon"
+maintainer: ["Jane Street Group, LLC <opensource@janestreet.com>"]
+authors: ["Jane Street Group, LLC <opensource@janestreet.com>"]
+license: "MIT"
+homepage: "https://github.com/ocaml/dune-cache-daemon"
+doc: "https://dune.readthedocs.io/"
+bug-reports: "https://github.com/ocaml/dune-cache-daemon/issues"
+depends: [
+  "angstrom" {= "0.14.1"}
+  "asn1-combinators" {= "0.2.2"}
+  "astring" {= "0.8.5"}
+  "base" {= "v0.14.0"}
+  "base-bytes" {= "base"}
+  "base-threads" {= "base"}
+  "base-unix" {= "base"}
+  "base64" {= "3.4.0"}
+  "bigarray-compat" {= "1.0.0"}
+  "bigstringaf" {= "0.6.1"}
+  "biniou" {= "1.2.1"}
+  "cmdliner" {= "1.0.4"}
+  "cohttp" {= "2.5.4"}
+  "cohttp-lwt" {= "2.5.4"}
+  "cohttp-lwt-unix" {= "2.5.4"}
+  "conduit" {= "2.1.0"}
+  "conduit-lwt" {= "2.1.0"}
+  "conduit-lwt-unix" {= "2.2.2"}
+  "conf-gmp" {= "2"}
+  "conf-gmp-powm-sec" {= "2"}
+  "conf-m4" {= "1"}
+  "conf-perl" {= "1"}
+  "conf-pkg-config" {= "1.3"}
+  "cppo" {= "1.6.6"}
+  "csexp" {= "1.3.2"}
+  "cstruct" {= "5.2.0"}
+  "cstruct-sexp" {= "5.2.0"}
+  "domain-name" {= "0.3.0"}
+  "dune" {= "2.8.0"}
+  "dune-configurator" {= "2.7.1"}
+  "dune-private-libs" {= "2.7.1"}
+  "duration" {= "0.1.3"}
+  "easy-format" {= "1.3.2"}
+  "eqaf" {= "0.7"}
+  "faraday" {= "0.7.2"}
+  "faraday-lwt" {= "0.7.2"}
+  "faraday-lwt-unix" {= "0.7.2"}
+  "fiat-p256" {= "0.2.1"}
+  "fieldslib" {= "v0.14.0"}
+  "fmt" {= "0.8.9"}
+  "gmap" {= "0.3.0"}
+  "hacl_x25519" {= "0.2.0"}
+  "hex" {= "1.4.0"}
+  "hkdf" {= "1.0.4"}
+  "httpaf" {= "0.6.6"}
+  "httpaf-lwt-unix" {= "0.6.6"}
+  "ipaddr" {= "5.0.0"}
+  "ipaddr-sexp" {= "5.0.0"}
+  "js_of_ocaml" {= "3.7.0"}
+  "js_of_ocaml-compiler" {= "3.7.0"}
+  "jsonm" {= "1.0.1"}
+  "logs" {= "0.7.0"}
+  "lwt" {= "5.3.0"}
+  "lwt_ppx" {= "2.0.1"}
+  "macaddr" {= "5.0.0"}
+  "magic-mime" {= "1.1.2"}
+  "menhir" {= "20200624"}
+  "menhirLib" {= "20200624"}
+  "menhirSdk" {= "20200624"}
+  "mirage-crypto" {= "0.8.5"}
+  "mirage-crypto-pk" {= "0.8.5"}
+  "mirage-crypto-rng" {= "0.8.5"}
+  "mirage-no-solo5" {= "1"}
+  "mirage-no-xen" {= "1"}
+  "mmap" {= "1.1.0"}
+  "mtime" {= "1.2.0"}
+  "num" {= "1.3"}
+  "ocaml" {= "4.10.0"}
+  "ocaml-compiler-libs" {= "v0.12.3"}
+  "ocaml-migrate-parsetree" {= "1.7.3"}
+  "ocamlbuild" {= "0.14.0"}
+  "ocamlfind" {= "1.8.1"}
+  "ocplib-endian" {= "1.1"}
+  "parsexp" {= "v0.14.0"}
+  "ppx_cstruct" {= "5.2.0"}
+  "ppx_derivers" {= "1.2.1"}
+  "ppx_fields_conv" {= "v0.14.1"}
+  "ppx_sexp_conv" {= "v0.14.1"}
+  "ppx_tools_versioned" {= "5.4.0"}
+  "ppxlib" {= "0.15.0"}
+  "ptime" {= "0.8.5"}
+  "re" {= "1.9.0"}
+  "result" {= "1.5"}
+  "rresult" {= "0.6.0"}
+  "seq" {= "base"}
+  "sexplib" {= "v0.14.0"}
+  "sexplib0" {= "v0.14.0"}
+  "stdlib-shims" {= "0.1.0"}
+  "stringext" {= "1.6.0"}
+  "tls" {= "0.12.5"}
+  "topkg" {= "1.0.3"}
+  "uchar" {= "0.0.2"}
+  "uri" {= "3.1.0"}
+  "uri-sexp" {= "3.1.0"}
+  "uutf" {= "1.0.2"}
+  "x509" {= "0.11.2"}
+  "yojson" {= "1.7.0"}
+  "zarith" {= "1.10"}
+]
+build: [
+  ["dune" "subst"] {pinned}
+  [
+    "dune"
+    "build"
+    "-p"
+    name
+    "-j"
+    jobs
+    "@install"
+    "@runtest" {with-test}
+    "@doc" {with-doc}
+  ]
+]
+dev-repo: "git+https://github.com/ocaml/dune-cache-daemon.git"
+name: "dune-cache-daemon"
+pin-depends: [
+  [
+    "httpaf-lwt-unix.0.6.6"
+    "git+https://github.com/mefyl/httpaf.git#feature/fix-multiple-requests-starvation"
+  ]
+  [
+    "dune-private-libs.2.7.1"
+    "git+https://github.com/mefyl/dune.git#feature/cache-jenga-support"
+  ]
+  [
+    "cohttp-lwt-unix.2.5.4"
+    "git+https://github.com/mirage/ocaml-cohttp.git#6d7b5fe0ca058123e0249cf5857c99beb9967a45"
+  ]
+  [
+    "httpaf.0.6.6"
+    "git+https://github.com/mefyl/httpaf.git#feature/fix-multiple-requests-starvation"
+  ]
+  [
+    "cohttp-lwt.2.5.4"
+    "git+https://github.com/mirage/ocaml-cohttp.git#6d7b5fe0ca058123e0249cf5857c99beb9967a45"
+  ]
+  [
+    "cohttp.2.5.4"
+    "git+https://github.com/mirage/ocaml-cohttp.git#6d7b5fe0ca058123e0249cf5857c99beb9967a45"
+  ]
+  [
+    "dune.2.8.0"
+    "git+https://github.com/mefyl/dune.git#feature/cache-jenga-support"
+  ]
+]
