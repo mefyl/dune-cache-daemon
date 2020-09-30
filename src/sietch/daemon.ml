@@ -343,7 +343,11 @@ let client_thread daemon client =
                       (Digest.to_string hash)
                   ]
               in
-              D.index_prefetch commits_index_key hash
+              let+ () = D.index_prefetch commits_index_key hash in
+              info
+                [ Pp.textf "done prefetching commit %S (%S)" repository.commit
+                    (Digest.to_string hash)
+                ]
             in
             let open Async in
             Async.Deferred.List.map ~f repositories >>= fun results ->
