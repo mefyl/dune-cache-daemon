@@ -323,7 +323,9 @@ let trim { root; ranges } ~goal =
     let* () = Lwt.pause () in
     let path = Path.relative root path in
     let* stats =
-      try%lwt Lwt.return @@ Option.some @@ Path.stat path
+      try%lwt
+        let stats = Path.stat path in
+        Lwt.return @@ Option.some_if (stats.st_kind = Unix.S_REG) stats
       with Unix.Unix_error (e, _, _) ->
         let* () =
           Logs_lwt.warn (fun m ->
