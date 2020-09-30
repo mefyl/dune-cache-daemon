@@ -152,17 +152,22 @@ let put_contents t target path contents =
 let get_file t target path local_path =
   if Path.exists local_path then
     debug
-      [ Pp.textf "metadata file already present locally: %s"
+      [ Pp.textf "artifact already present locally: %s"
           (Path.to_string local_path)
       ]
     |> Async.Deferred.Result.return
   else
-    let* status, body = call t target `GET path in
+    let* response, body = call t target `GET path in
     let* () =
-      expect_status [ `OK ] `GET path (Cohttp.Response.status status)
+      expect_status [ `OK ] `GET path (Cohttp.Response.status response)
       |> Async.return
     in
-    write_file t.cache local_path true (Cohttp_async.Body.to_pipe body)
+    let executable =
+      Poly.( = )
+        (Cohttp.Header.get (Cohttp.Response.headers response) "X-executable")
+        (Some "1")
+    in
+    write_file t.cache local_path executable (Cohttp_async.Body.to_pipe body)
 
 let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
     =
