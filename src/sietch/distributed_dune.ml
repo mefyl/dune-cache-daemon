@@ -187,10 +187,20 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
             Async.Deferred.Result.return status
           in
           let insert stats input =
-            let body = Cohttp_async.Body.of_pipe @@ Async.Reader.pipe input in
-            query
-              ~headers:[ ("Content-Length", Int.to_string stats.Unix.st_size) ]
-              `PUT ~body
+            let body = Cohttp_async.Body.of_pipe @@ Async.Reader.pipe input
+            and headers =
+              let executable =
+                if stats.Unix.st_perm land 0o100 > 0 then
+                  "1"
+                else
+                  "0"
+              in
+              [ ("X-executable", executable)
+              ; ("Content-Length", Int.to_string stats.Unix.st_size)
+              ]
+            in
+
+            query ~headers `PUT ~body
           in
           let stats = Path.stat path in
           let* upload =
