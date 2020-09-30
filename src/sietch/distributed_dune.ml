@@ -125,9 +125,6 @@ let call t target meth ?(headers = []) ?body path =
              (Digest.to_string target) (Digest.to_string hash)
        | None -> Async.Deferred.Result.return ()
      in
-     let* body =
-       Cohttp_async.Body.to_string body |> Async.Deferred.map ~f:Result.return
-     in
      Async.Deferred.Result.return (Cohttp.Response.status response, body))
     >>= function
     | Result.Ok _ as res -> Async.return res
@@ -145,7 +142,10 @@ let expect_status expected m path = function
 
 let put_contents t target path contents =
   let body = Cohttp_async.Body.of_string contents in
-  let* status, _body = call t target `PUT ~body path in
+  let* status, body = call t target `PUT ~body path in
+  let* () =
+    Cohttp_async.Body.drain body |> Async.Deferred.map ~f:Result.return
+  in
   Async.return @@ expect_status [ `Created; `OK ] `PUT path status
 
 let get_file t target path local_path =
@@ -158,7 +158,7 @@ let get_file t target path local_path =
   else
     let* status, body = call t target `GET path in
     let* () = expect_status [ `OK ] `GET path status |> Async.return in
-    write_file t.cache local_path true body
+    write_file t.cache local_path true (Cohttp_async.Body.to_pipe body)
 
 let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
     =
@@ -170,7 +170,11 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
           let path = Local.file_path cache digest in
           let query ?(headers = []) ?body meth =
             let path = "blocks/" ^ Digest.to_string digest in
-            let* status, _body = call t digest meth ~headers ?body path in
+            let* status, body = call t digest meth ~headers ?body path in
+            let* () =
+              Cohttp_async.Body.drain body
+              |> Async.Deferred.map ~f:Result.return
+            in
             Async.Deferred.Result.return status
           in
           let insert stats input =
@@ -236,7 +240,15 @@ let prefetch ({ cache; _ } as t) key =
       let hash = Digest.to_string key in
       let path = "blocks/" ^ hash in
       let () = debug [ Pp.textf "fetch metadata %s" hash ] in
-      let* status, body = call t key `GET path in
+      let* status, body =
+        let* status, body = call t key `GET path in
+        let* body =
+          Cohttp_async.Body.to_string body
+          |> Async.Deferred.map ~f:Result.return
+        in
+        Async.Deferred.Result.return (status, body)
+      in
+
       let* () =
         expect_status [ `OK; `No_content ] `GET path status |> Async.return
       in
@@ -260,7 +272,7 @@ let prefetch ({ cache; _ } as t) key =
           let* results = Async.Deferred.List.all @@ List.map ~f:fetch files in
           let ( let* ) = Async.Deferred.Result.( >>= ) in
           let* (_ : unit list) = results |> Result.List.all |> Async.return in
-          write_file cache local_path false body
+          write_file cache local_path false (Async.Pipe.of_list [ body ])
         | Value h ->
           let () =
             debug [ Pp.textf "skipping Jenga value: %s" (Digest.to_string h) ]
@@ -291,6 +303,10 @@ let index_prefetch t name key =
   let f () =
     let path = index_path name key in
     let* status, body = call t key `GET path in
+    let* body =
+      (* FIXME: parse the index file on the fly instead of dumping in to memory *)
+      Cohttp_async.Body.to_string body |> Async.Deferred.map ~f:Result.return
+    in
     let* () =
       expect_status [ `OK; `No_content ] `GET path status |> Async.return
     in

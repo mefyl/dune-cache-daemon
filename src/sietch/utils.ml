@@ -129,7 +129,8 @@ let write_file local path executable contents =
     let* () =
       let write () =
         let* output = Async.Writer.open_file ~perm path_tmp in
-        let () = Async.Writer.write output contents in
+        let pipe = Async.Writer.pipe output in
+        let* () = Async.Pipe.transfer contents pipe ~f:Base.Fn.id in
         Async.Writer.close output
       in
       Local.throttle_fd local write
