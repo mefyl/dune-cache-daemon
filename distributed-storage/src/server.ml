@@ -352,6 +352,7 @@ let trim { root; ranges } ~goal =
           Logs_lwt.warn (fun m ->
               m "remove out-of-range file: %s" (Path.to_string path))
         in
+        let () = Path.unlink path in
         Lwt.return size
       | None ->
         let* () =
