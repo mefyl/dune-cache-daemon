@@ -248,7 +248,7 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
   | Result.Error e ->
     Code_error.raise "distribute fatal error" [ ("exception", Exn.to_dyn e) ]
 
-let prefetch ({ cache; _ } as t) key =
+let prefetch ({ cache; _ } as t) count i key =
   let f () =
     let local_path = Local.metadata_path cache key in
     if Path.exists local_path then
@@ -260,7 +260,7 @@ let prefetch ({ cache; _ } as t) key =
     else
       let hash = Digest.to_string key in
       let path = "blocks/" ^ hash in
-      let () = debug [ Pp.textf "fetch metadata %s" hash ] in
+      let () = debug [ Pp.textf "fetch metadata %s (%i/%i)" hash i count ] in
       let* response, body =
         let* status, body = call t key `GET path in
         let* body =
@@ -337,10 +337,11 @@ let index_prefetch t name key =
         String.split ~on:'\n' body
         |> List.filter_map ~f:(fun d -> Digest.from_hex d)
       in
+      let count = List.length keys in
       let ( let* ) = Async.Deferred.( >>= ) in
       let* results =
-        Async.Deferred.List.map ~how:(`Max_concurrent_jobs 8) ~f:(prefetch t)
-          keys
+        Async.Deferred.List.mapi ~how:(`Max_concurrent_jobs 8)
+          ~f:(prefetch t count) keys
       in
       let ( let* ) = Async.Deferred.Result.( >>= ) in
       let* (_ : unit list) = Result.List.all results |> Async.return in
@@ -349,8 +350,18 @@ let index_prefetch t name key =
       Async.Deferred.Result.return ()
   in
   let ( >>= ) = Async.Deferred.( >>= ) in
+  let start = Unix.time () in
   Async.try_with ~extract_exn:true f >>= function
-  | Result.Ok v -> Async.return v
+  | Result.Ok v ->
+    let elapsed = Unix.time () -. start in
+    let () =
+      debug
+        [ Pp.textf "prefetched commit %S in %f seconds" (Digest.to_string key)
+            elapsed
+        ]
+    in
+
+    Async.return v
   | Result.Error e ->
     Async.Deferred.Result.fail
       (Fmt.str "index_prefetch fatal error: %a" Exn.pp e)
@@ -363,7 +374,7 @@ let make config local =
 
     let distribute = distribute v
 
-    let prefetch = prefetch v
+    let prefetch = prefetch v 1 1
 
     let index_add = index_add v
 
