@@ -20,10 +20,8 @@ type t =
   }
 
 and client =
-  { requests :
-      (Cohttp.Request.t * Cohttp_async.Body.t) Async_kernel.Pipe.Writer.t
-  ; responses :
-      (Cohttp.Response.t * Cohttp_async.Body.t) Async_kernel.Pipe.Reader.t
+  { connection : H2.Client_connection.t
+  ; socket : ([ `Active ], Async.Socket.Address.Inet.t) Async.Socket.t
   ; uri : Uri.t
   }
 
@@ -35,13 +33,34 @@ let connect t uri =
   let () =
     debug [ Pp.textf "connect to distributed backend %S" (Uri.to_string uri) ]
   in
-  let host = Uri.with_uri ~path:None uri in
-  let requests_reader, requests = Async.Pipe.create () in
-  let* responses =
-    Cohttp_async.Client.callv host requests_reader
-    |> Async.Deferred.map ~f:Result.return
+  let host = Option.value_exn (Uri.host uri)
+  and port =
+    match Uri.port uri with
+    | Some port -> port
+    | None -> (
+      match Uri.scheme uri with
+      | Some "https" -> 443
+      | Some "http" -> 80
+      | _ -> failwith "unable to determine port" )
   in
-  let client = { requests; responses; uri } in
+  let socket = Async.Socket.create Async.Socket.Type.tcp in
+  let* client =
+    let* addr_info =
+      Async.Unix.Inet_addr.of_string_or_getbyname host
+      |> Async.Deferred.map ~f:Result.return
+    in
+    let+ socket =
+      Async.Socket.connect socket (`Inet (addr_info, port))
+      |> Async.Deferred.map ~f:Result.return
+    in
+    let () = debug [ Pp.textf "CONNECTED" ] in
+    let connection =
+      (* FIXME: error_handler *)
+      H2.Client_connection.create ?config:None ?push_handler:None
+        ~error_handler:(fun _ -> ())
+    in
+    { connection; socket; uri }
+  in
   let* clients =
     Clients.add t.clients uri client
     |> Result.map_error ~f:(fun _ -> "duplicate client")
@@ -49,6 +68,67 @@ let connect t uri =
     |> Async.return
   in
   let () = t.clients <- clients in
+  let () =
+    let ( let* ) = Async.( >>= ) in
+    let io =
+      let read_connection =
+        let handle_chunk buffer ~pos ~len =
+          let buffer =
+            (* FIXME: I couldn't find an efficient conversion between
+               Bigstringaf and Core.Bigstring *)
+            Bigstringaf.of_string ~off:0 ~len:(Core.Bigstring.length buffer)
+            @@ Core.Bigstring.to_string buffer
+          in
+          let read =
+            H2.Client_connection.read client.connection buffer ~off:pos ~len
+          in
+          match H2.Client_connection.next_read_operation client.connection with
+          | `Close -> Async.return @@ `Stop ()
+          | `Read -> Async.return @@ `Consumed (read, `Need_unknown)
+        in
+        let close () = Async.return @@ Async.Socket.shutdown socket `Receive in
+        match H2.Client_connection.next_read_operation client.connection with
+        | `Close -> close ()
+        | `Read ->
+          let* _ =
+            Async.Reader.read_one_chunk_at_a_time
+              (Async.Reader.create (Async.Socket.fd socket))
+              ~handle_chunk
+          in
+          close ()
+      and write_connection =
+        let writer = Async.Writer.create (Async.Socket.fd socket)
+        and wait = Async.Ivar.create () in
+        let rec write () =
+          match H2.Client_connection.next_write_operation client.connection with
+          | `Close _ ->
+            let () = Async.Socket.shutdown socket `Send in
+            Async.Ivar.fill wait ()
+          | `Yield -> H2.Client_connection.yield_writer client.connection write
+          | `Write vectors ->
+            let () =
+              let f l { Faraday.buffer; off = pos; len } =
+                (* FIXME: I couldn't find an efficient conversion between
+                   Bigstringaf and Core.Bigstring *)
+                let buffer = Bigstringaf.to_string buffer in
+                let () = Async.Writer.write ~pos ~len writer buffer in
+                l + len
+              in
+              let written = List.fold_left ~f ~init:0 vectors in
+              let () = debug [ Pp.textf "WRITTEN %d" written ] in
+              H2.Client_connection.report_write_result client.connection
+                (`Ok written)
+            in
+            write ()
+        in
+        let () = write () in
+        Async.Ivar.read wait
+      in
+      let* (), () = Async.Deferred.both read_connection write_connection in
+      Async.Unix.close (Async.Socket.fd socket)
+    in
+    Async.don't_wait_for io
+  in
   Async.Deferred.Result.return client
 
 let digest_of_str str =
@@ -71,64 +151,77 @@ let client t target =
   | Some client -> Async.Deferred.Result.return client
   | None -> connect t uri
 
-let mutex = ref (Async.Ivar.create_full (Result.Ok ()))
-
 let call t target meth ?(headers = []) ?body path =
+  let ( >>= ) = Async.( >>= )
+  and ( >>| ) = Async.( >>| ) in
   let* client = client t target in
   let uri =
     Uri.with_uri ~path:(Option.some @@ Uri.path client.uri ^ path) client.uri
-  and headers, body, encoding =
-    match body with
-    | Some body ->
-      ( Cohttp.Header.of_list
-        @@ (("Content-Type", "application/octet-stream") :: headers)
-      , body
-      , Cohttp.Transfer.Chunked )
-    | None ->
-      ( Cohttp.Header.of_list @@ (("Content-Length", "0") :: headers)
-      , Cohttp_async.Body.empty
-      , Cohttp.Transfer.Fixed 0L )
   in
-  let lock = !mutex
-  and unlock = Async.Ivar.create () in
-  let () = mutex := unlock in
-  let* () =
-    let request = Cohttp.Request.make ~meth ~encoding ~headers uri in
-    Async.Pipe.write client.requests (request, body)
-    |> Async.Deferred.map ~f:Result.return
+  let request, body =
+    let headers, body =
+      match body with
+      | Some body ->
+        ( H2.Headers.of_list
+          @@ (("Content-Type", "application/octet-stream") :: headers)
+        , body )
+      | None -> (H2.Headers.empty, Async.Pipe.of_list [])
+    and scheme = Option.value_exn (Uri.scheme uri)
+    and path = Uri.path uri in
+    (H2.Request.create ~headers ~scheme meth path, body)
   in
-  let* () = Async.Ivar.read lock in
-  let ( >>= ) = Async.( >>= ) in
-  Async.Pipe.read client.responses >>= function
-  | `Eof ->
-    let () =
-      Caml.Format.eprintf "FATAL EMPTY %s\n%!" (Digest.to_string target)
+  let result = Async.Ivar.create () in
+  let response_handler response body =
+    let reader, writer = Async.Pipe.create () in
+    let rec on_eof () = Async.Pipe.close writer
+    and on_read buffer ~off ~len =
+      let bytes = Bytes.make len '\x00' in
+      let () =
+        Bigstringaf.blit_to_bytes buffer ~src_off:off bytes ~dst_off:0 ~len
+      in
+      let read =
+        Async.Pipe.write writer (Bytes.unsafe_to_string bytes) >>| fun () ->
+        H2.Body.schedule_read ~on_eof ~on_read body
+      in
+      Async.don't_wait_for read
     in
-    let () = Async.Ivar.fill unlock (Result.Ok ()) in
-    Async.Deferred.Result.fail "error during HTTP request: no response"
-  | `Ok (response, body) -> (
-    (let drain () =
-       Cohttp_async.Body.drain body |> Async.Deferred.map ~f:Result.return
-     in
-     let () = Async.Ivar.fill unlock (Result.Ok ()) in
-     let* () =
-       let headers = Cohttp.Response.headers response in
-       match Cohttp.Header.get headers "X-dune-hash" with
-       | Some hash ->
-         let* hash = digest_of_str hash in
-         if Poly.( = ) (Digest.compare hash target) Ordering.Eq then
-           Async.Deferred.Result.return ()
-         else
-           let* () = drain () in
-           Async.Deferred.Result.failf
-             "invalid hash for artifact: expected %s, effective %s"
-             (Digest.to_string target) (Digest.to_string hash)
-       | None -> Async.Deferred.Result.return ()
-     in
-     Async.Deferred.Result.return (response, body))
-    >>= function
-    | Result.Ok _ as res -> Async.return res
-    | Result.Error _e as error -> Async.return error )
+    let () = H2.Body.schedule_read ~on_eof ~on_read body in
+    Async.Ivar.fill result @@ Result.return (response, reader)
+  in
+  let request =
+    (* FIXME: error_handler *)
+    H2.Client_connection.request client.connection request
+      ~error_handler:(fun _ -> ())
+      ~response_handler
+  in
+  let () =
+    let rec send_chunk () =
+      Async.Pipe.read body >>= function
+      | `Eof -> Async.return @@ H2.Body.close_writer request
+      | `Ok chunk ->
+        let wait = Async.Ivar.create ()
+        and () = H2.Body.write_string request chunk in
+        let () = H2.Body.flush request (fun () -> Async.Ivar.fill wait ()) in
+        Async.Ivar.read wait >>= fun () -> send_chunk ()
+    in
+    Async.don't_wait_for (send_chunk ())
+  in
+  let* response, body = Async.Ivar.read result in
+  let drain () = Async.Pipe.drain body |> Async.Deferred.map ~f:Result.return in
+  let* () =
+    match H2.Headers.get response.headers "X-dune-hash" with
+    | Some hash ->
+      let* hash = digest_of_str hash in
+      if Poly.( = ) (Digest.compare hash target) Ordering.Eq then
+        Async.Deferred.Result.return ()
+      else
+        let* () = drain () in
+        Async.Deferred.Result.failf
+          "invalid hash for artifact: expected %s, effective %s"
+          (Digest.to_string target) (Digest.to_string hash)
+    | None -> Async.Deferred.Result.return ()
+  in
+  Async.Deferred.Result.return (response, body)
 
 let expect_status expected m path = function
   | effective when List.exists ~f:(Poly.( = ) effective) expected ->
@@ -136,18 +229,16 @@ let expect_status expected m path = function
   | effective ->
     Result.Error
       (Fmt.str "unexpected %s on %s %s"
-         (Cohttp.Code.string_of_status effective)
-         (Cohttp.Code.string_of_method m)
-         path)
+         (H2.Status.to_string effective)
+         (H2.Method.to_string m) path)
 
 let put_contents t target path contents =
-  let body = Cohttp_async.Body.of_string contents in
-  let* response, body = call t target `PUT ~body path in
-  let* () =
-    Cohttp_async.Body.drain body |> Async.Deferred.map ~f:Result.return
+  let* response, body =
+    let body = Async.Pipe.of_list [ contents ] in
+    call t target `PUT ~body path
   in
-  Async.return
-  @@ expect_status [ `Created; `OK ] `PUT path (Cohttp.Response.status response)
+  let* () = Async.Pipe.drain body |> Async.Deferred.map ~f:Result.return in
+  Async.return @@ expect_status [ `Created; `OK ] `PUT path response.status
 
 let get_file t target path local_path =
   if Path.exists local_path then
@@ -158,16 +249,11 @@ let get_file t target path local_path =
     |> Async.Deferred.Result.return
   else
     let* response, body = call t target `GET path in
-    let* () =
-      expect_status [ `OK ] `GET path (Cohttp.Response.status response)
-      |> Async.return
-    in
+    let* () = expect_status [ `OK ] `GET path response.status |> Async.return in
     let executable =
-      Poly.( = )
-        (Cohttp.Header.get (Cohttp.Response.headers response) "X-executable")
-        (Some "1")
+      Poly.( = ) (H2.Headers.get response.headers "X-executable") (Some "1")
     in
-    write_file t.cache local_path executable (Cohttp_async.Body.to_pipe body)
+    write_file t.cache local_path executable body
 
 let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
     =
@@ -181,13 +267,12 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
             let path = "blocks/" ^ Digest.to_string digest in
             let* status, body = call t digest meth ~headers ?body path in
             let* () =
-              Cohttp_async.Body.drain body
-              |> Async.Deferred.map ~f:Result.return
+              Async.Pipe.drain body |> Async.Deferred.map ~f:Result.return
             in
             Async.Deferred.Result.return status
           in
           let insert stats input =
-            let body = Cohttp_async.Body.of_pipe @@ Async.Reader.pipe input
+            let body = Async.Reader.pipe input
             and headers =
               let executable =
                 if stats.Unix.st_perm land 0o100 > 0 then
@@ -207,14 +292,14 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
             if stats.st_size < 4096 then
               Async.Deferred.Result.return true
             else
-              let* status = query `HEAD in
-              let status = Cohttp.Response.status status in
+              let* response = query `HEAD in
               let* () =
                 Async.return
                 @@ expect_status [ `OK; `No_content ] `HEAD
-                     (Path.to_string path) status
+                     (Path.to_string path) response.status
               in
-              Async.Deferred.Result.return (Poly.( = ) status `No_content)
+              Async.Deferred.Result.return
+                (Poly.( = ) response.status `No_content)
           in
           if upload then
             let* response =
@@ -224,7 +309,7 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
             in
             Async.return
             @@ expect_status [ `Created; `OK ] `PUT (Path.to_string path)
-                 (Cohttp.Response.status response)
+                 response.status
           else
             Async.Deferred.Result.return ()
         in
@@ -248,6 +333,10 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
   | Result.Error e ->
     Code_error.raise "distribute fatal error" [ ("exception", Exn.to_dyn e) ]
 
+let string_of_body body =
+  let+ body = Async.Pipe.read_all body |> Async.Deferred.map ~f:Result.return in
+  Core_kernel.Queue.fold ~f:( ^ ) ~init:"" body
+
 let prefetch ({ cache; _ } as t) count i key =
   let f () =
     let local_path = Local.metadata_path cache key in
@@ -263,17 +352,14 @@ let prefetch ({ cache; _ } as t) count i key =
       let () = debug [ Pp.textf "fetch metadata %s (%i/%i)" hash i count ] in
       let* response, body =
         let* status, body = call t key `GET path in
-        let* body =
-          Cohttp_async.Body.to_string body
-          |> Async.Deferred.map ~f:Result.return
-        in
+        let* body = string_of_body body in
         Async.Deferred.Result.return (status, body)
       in
-      let status = Cohttp.Response.status response in
       let* () =
-        expect_status [ `OK; `No_content ] `GET path status |> Async.return
+        expect_status [ `OK; `No_content ] `GET path response.status
+        |> Async.return
       in
-      if Poly.( = ) status `No_content then
+      if Poly.( = ) response.status `No_content then
         Async.Deferred.Result.return ()
       else
         let* metadata =
@@ -324,15 +410,15 @@ let index_prefetch t name key =
   let f () =
     let path = index_path name key in
     let* response, body = call t key `GET path in
-    let status = Cohttp.Response.status response in
     let* body =
       (* FIXME: parse the index file on the fly instead of dumping in to memory *)
-      Cohttp_async.Body.to_string body |> Async.Deferred.map ~f:Result.return
+      string_of_body body
     in
     let* () =
-      expect_status [ `OK; `No_content ] `GET path status |> Async.return
+      expect_status [ `OK; `No_content ] `GET path response.status
+      |> Async.return
     in
-    if Poly.( = ) status `OK then
+    if Poly.( = ) response.status `OK then
       let keys =
         String.split ~on:'\n' body
         |> List.filter_map ~f:(fun d -> Digest.from_hex d)
