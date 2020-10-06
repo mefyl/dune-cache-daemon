@@ -1,4 +1,4 @@
-open Httpaf
+open H2
 open Stdune
 open Utils
 open Dune_cache_daemon
@@ -10,13 +10,11 @@ type t =
 
 exception Misdirected of Digest.t * Config.range list
 
-exception Bad_request of string
-
 exception Method_not_allowed of Httpaf.Method.t
 
 let status_to_string = function
   | `Code i -> Format.sprintf "%i" i
-  | #Status.standard as status ->
+  | #H2.Status.standard as status ->
     Format.sprintf "%s %s" (Status.to_string status)
       (Status.default_reason_phrase status)
 
@@ -45,8 +43,6 @@ let error reqd status =
       Lwt.return @@ Reqd.respond_with_string reqd response contents
   in
   Format.ksprintf (error reqd status)
-
-let bad_request = Format.ksprintf (fun reason -> raise (Bad_request reason))
 
 module Blocks = struct
   let check_range ranges address =
@@ -249,6 +245,7 @@ module Blocks = struct
 end
 
 let request_handler t sockaddr reqd =
+  let () = Caml.print_endline "REQUEST_HANDLER" in
   let { Request.meth; target; Request.headers; _ } = Reqd.request reqd in
   let respond () =
     let* () =
@@ -267,17 +264,15 @@ let request_handler t sockaddr reqd =
     try%lwt
       match String.split ~on:'/' target with
       | [ ""; "blocks"; hash ] -> (
-        let hash =
-          match Digest.from_hex hash with
-          | Some hash -> hash
-          | None -> bad_request "invalid hash: %S" hash
-        in
-        match meth with
-        | `HEAD -> Blocks.head t reqd hash
-        | `GET -> Blocks.get t reqd hash
-        | `PUT ->
-          let executable = Headers.get headers "X-executable" = Some "1" in
-          Blocks.put t reqd hash executable )
+        match Digest.from_hex hash with
+        | None -> error reqd `Bad_request "invalid hash: %S" hash
+        | Some hash -> (
+          match meth with
+          | `HEAD -> Blocks.head t reqd hash
+          | `GET -> Blocks.get t reqd hash
+          | `PUT ->
+            let executable = Headers.get headers "X-executable" = Some "1" in
+            Blocks.put t reqd hash executable ) )
       | [ ""; "index"; path; hash ] -> (
         match Digest.from_hex hash with
         | None -> error reqd `Bad_request "invalid hash: %S" hash
@@ -290,7 +285,6 @@ let request_handler t sockaddr reqd =
         error reqd `Bad_request "no such endpoint: %S"
           (String.concat ~sep:"/" path)
     with
-    | Bad_request reason -> error reqd `Bad_request "%s" reason
     | Method_not_allowed _ ->
       error reqd `Method_not_allowed "method not allowed"
     | Misdirected (addr, _) ->
@@ -298,13 +292,29 @@ let request_handler t sockaddr reqd =
   in
   Lwt.async respond
 
-let error_handler _ ?request:_ error start_response =
+let error_handler sockaddr ?request error start_response =
+  let () =
+    match request with
+    | Some (request : H2.Request.t) ->
+      Logs.info (fun m ->
+          m "%s: %s %s"
+            (string_of_sockaddr sockaddr)
+            (Method.to_string request.meth)
+            request.target)
+    | None ->
+      Logs.info (fun m -> m "%s: invalid request" (string_of_sockaddr sockaddr))
+  in
   let response_body = start_response Headers.empty in
   ( match error with
   | `Exn exn ->
+    let () = Logs.info (fun m -> m "> exception handling request") in
     Body.write_string response_body (Printexc.to_string exn);
     Body.write_string response_body "\n"
   | #Status.standard as error ->
+    let () =
+      Logs.info (fun m ->
+          m "> %s: error handling request" (status_to_string error))
+    in
     Body.write_string response_body (Status.default_reason_phrase error) );
   Body.close_writer response_body
 
@@ -415,8 +425,7 @@ let run config host port root trim_period trim_size =
   let t = { root; ranges } in
   let request_handler = request_handler t in
   let handler =
-    Httpaf_lwt_unix.Server.create_connection_handler ~request_handler
-      ~error_handler
+    H2_lwt_unix.Server.create_connection_handler ~request_handler ~error_handler
   in
   let listen_address = Unix.(ADDR_INET (host, port)) in
   try%lwt
