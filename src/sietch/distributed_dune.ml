@@ -223,11 +223,28 @@ let call t target meth ?(headers = []) ?body path =
   in
   Async.Deferred.Result.return (response, body)
 
-let expect_status expected m path = function
+let string_of_body body =
+  let+ body = Async.Pipe.read_all body |> Async.Deferred.map ~f:Result.return in
+  Core_kernel.Queue.fold ~f:( ^ ) ~init:"" body
+
+let expect_status expected m path body = function
   | effective when List.exists ~f:(Poly.( = ) effective) expected ->
-    Result.Ok ()
+    Async.Deferred.Result.return ()
   | effective ->
-    Result.Error
+    let* body = string_of_body body in
+    let () =
+      let open Pp in
+      let open Pp.O in
+      debug
+        [ ( hbox
+          @@ textf "unexpected %s on %s %s"
+               (H2.Status.to_string effective)
+               (H2.Method.to_string m) path )
+          ++ newline
+          ++ (box @@ Pp.text body)
+        ]
+    in
+    Async.Deferred.Result.fail
       (Fmt.str "unexpected %s on %s %s"
          (H2.Status.to_string effective)
          (H2.Method.to_string m) path)
@@ -237,8 +254,8 @@ let put_contents t target path contents =
     let body = Async.Pipe.of_list [ contents ] in
     call t target `PUT ~body path
   in
-  let* () = Async.Pipe.drain body |> Async.Deferred.map ~f:Result.return in
-  Async.return @@ expect_status [ `Created; `OK ] `PUT path response.status
+  let* () = expect_status [ `Created; `OK ] `PUT path body response.status in
+  Async.Pipe.drain body |> Async.Deferred.map ~f:Result.return
 
 let get_file t target path local_path =
   if Path.exists local_path then
@@ -249,7 +266,7 @@ let get_file t target path local_path =
     |> Async.Deferred.Result.return
   else
     let* response, body = call t target `GET path in
-    let* () = expect_status [ `OK ] `GET path response.status |> Async.return in
+    let* () = expect_status [ `OK ] `GET path body response.status in
     let executable =
       Poly.( = ) (H2.Headers.get response.headers "X-executable") (Some "1")
     in
@@ -263,13 +280,14 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
       | Files files ->
         let insert_file { Cache.File.digest; _ } =
           let path = Local.file_path cache digest in
-          let query ?(headers = []) ?body meth =
+          let query ?(headers = []) ?body meth expected =
             let path = "blocks/" ^ Digest.to_string digest in
-            let* status, body = call t digest meth ~headers ?body path in
+            let* response, body = call t digest meth ~headers ?body path in
+            let* () = expect_status expected meth path body response.status in
             let* () =
               Async.Pipe.drain body |> Async.Deferred.map ~f:Result.return
             in
-            Async.Deferred.Result.return status
+            Async.Deferred.Result.return response
           in
           let insert stats input =
             let body = Async.Reader.pipe input
@@ -284,32 +302,24 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
               ; ("Content-Length", Int.to_string stats.Unix.st_size)
               ]
             in
-
-            query ~headers `PUT ~body
+            query ~headers `PUT [ `Created; `OK ] ~body
           in
           let stats = Path.stat path in
           let* upload =
             if stats.st_size < 4096 then
               Async.Deferred.Result.return true
             else
-              let* response = query `HEAD in
-              let* () =
-                Async.return
-                @@ expect_status [ `OK; `No_content ] `HEAD
-                     (Path.to_string path) response.status
-              in
+              let* response = query `HEAD [ `OK; `No_content ] in
               Async.Deferred.Result.return
                 (Poly.( = ) response.status `No_content)
           in
           if upload then
-            let* response =
+            let+ response =
               let path = Path.to_string path in
               let () = debug [ Pp.textf "distribute %S" path ] in
               Async.Reader.with_file path ~f:(insert stats)
             in
-            Async.return
-            @@ expect_status [ `Created; `OK ] `PUT (Path.to_string path)
-                 response.status
+            ignore response
           else
             Async.Deferred.Result.return ()
         in
@@ -333,10 +343,6 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
   | Result.Error e ->
     Code_error.raise "distribute fatal error" [ ("exception", Exn.to_dyn e) ]
 
-let string_of_body body =
-  let+ body = Async.Pipe.read_all body |> Async.Deferred.map ~f:Result.return in
-  Core_kernel.Queue.fold ~f:( ^ ) ~init:"" body
-
 let prefetch ({ cache; _ } as t) count i key =
   let f () =
     let local_path = Local.metadata_path cache key in
@@ -350,15 +356,11 @@ let prefetch ({ cache; _ } as t) count i key =
       let hash = Digest.to_string key in
       let path = "blocks/" ^ hash in
       let () = debug [ Pp.textf "fetch metadata %s (%i/%i)" hash i count ] in
-      let* response, body =
-        let* status, body = call t key `GET path in
-        let* body = string_of_body body in
-        Async.Deferred.Result.return (status, body)
-      in
+      let* response, body = call t key `GET path in
       let* () =
-        expect_status [ `OK; `No_content ] `GET path response.status
-        |> Async.return
+        expect_status [ `OK; `No_content ] `GET path body response.status
       in
+      let* body = string_of_body body in
       if Poly.( = ) response.status `No_content then
         Async.Deferred.Result.return ()
       else
@@ -410,13 +412,12 @@ let index_prefetch t name key =
   let f () =
     let path = index_path name key in
     let* response, body = call t key `GET path in
+    let* () =
+      expect_status [ `OK; `No_content ] `GET path body response.status
+    in
     let* body =
       (* FIXME: parse the index file on the fly instead of dumping in to memory *)
       string_of_body body
-    in
-    let* () =
-      expect_status [ `OK; `No_content ] `GET path response.status
-      |> Async.return
     in
     if Poly.( = ) response.status `OK then
       let keys =
