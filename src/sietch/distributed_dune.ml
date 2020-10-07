@@ -20,7 +20,7 @@ type t =
   }
 
 and client =
-  { connection : H2.Client_connection.t
+  { connection : H2_async.Client.t
   ; socket : ([ `Active ], Async.Socket.Address.Inet.t) Async.Socket.t
   ; uri : Uri.t
   }
@@ -49,15 +49,15 @@ let connect t uri =
       Async.Unix.Inet_addr.of_string_or_getbyname host
       |> Async.Deferred.map ~f:Result.return
     in
-    let+ socket =
+    let* socket =
       Async.Socket.connect socket (`Inet (addr_info, port))
       |> Async.Deferred.map ~f:Result.return
     in
     let () = debug [ Pp.textf "CONNECTED" ] in
-    let connection =
+    let+ connection =
       (* FIXME: error_handler *)
-      H2.Client_connection.create ?config:None ?push_handler:None
-        ~error_handler:(fun _ -> ())
+      H2_async.Client.create_connection ~error_handler:(fun _ -> ()) socket
+      |> Async.Deferred.map ~f:Result.return
     in
     { connection; socket; uri }
   in
@@ -68,67 +68,6 @@ let connect t uri =
     |> Async.return
   in
   let () = t.clients <- clients in
-  let () =
-    let ( let* ) = Async.( >>= ) in
-    let io =
-      let read_connection =
-        let handle_chunk buffer ~pos ~len =
-          let buffer =
-            (* FIXME: I couldn't find an efficient conversion between
-               Bigstringaf and Core.Bigstring *)
-            Bigstringaf.of_string ~off:0 ~len:(Core.Bigstring.length buffer)
-            @@ Core.Bigstring.to_string buffer
-          in
-          let read =
-            H2.Client_connection.read client.connection buffer ~off:pos ~len
-          in
-          match H2.Client_connection.next_read_operation client.connection with
-          | `Close -> Async.return @@ `Stop ()
-          | `Read -> Async.return @@ `Consumed (read, `Need_unknown)
-        in
-        let close () = Async.return @@ Async.Socket.shutdown socket `Receive in
-        match H2.Client_connection.next_read_operation client.connection with
-        | `Close -> close ()
-        | `Read ->
-          let* _ =
-            Async.Reader.read_one_chunk_at_a_time
-              (Async.Reader.create (Async.Socket.fd socket))
-              ~handle_chunk
-          in
-          close ()
-      and write_connection =
-        let writer = Async.Writer.create (Async.Socket.fd socket)
-        and wait = Async.Ivar.create () in
-        let rec write () =
-          match H2.Client_connection.next_write_operation client.connection with
-          | `Close _ ->
-            let () = Async.Socket.shutdown socket `Send in
-            Async.Ivar.fill wait ()
-          | `Yield -> H2.Client_connection.yield_writer client.connection write
-          | `Write vectors ->
-            let () =
-              let f l { Faraday.buffer; off = pos; len } =
-                (* FIXME: I couldn't find an efficient conversion between
-                   Bigstringaf and Core.Bigstring *)
-                let buffer = Bigstringaf.to_string buffer in
-                let () = Async.Writer.write ~pos ~len writer buffer in
-                l + len
-              in
-              let written = List.fold_left ~f ~init:0 vectors in
-              let () = debug [ Pp.textf "WRITTEN %d" written ] in
-              H2.Client_connection.report_write_result client.connection
-                (`Ok written)
-            in
-            write ()
-        in
-        let () = write () in
-        Async.Ivar.read wait
-      in
-      let* (), () = Async.Deferred.both read_connection write_connection in
-      Async.Unix.close (Async.Socket.fd socket)
-    in
-    Async.don't_wait_for io
-  in
   Async.Deferred.Result.return client
 
 let digest_of_str str =
@@ -159,6 +98,9 @@ let call t target meth ?(headers = []) ?body path =
     Uri.with_uri ~path:(Option.some @@ Uri.path client.uri ^ path) client.uri
   in
   let request, body =
+    let headers =
+      (":authority", Option.value_exn (Uri.host client.uri)) :: headers
+    in
     let headers, body =
       match body with
       | Some body ->
@@ -190,7 +132,7 @@ let call t target meth ?(headers = []) ?body path =
   in
   let request =
     (* FIXME: error_handler *)
-    H2.Client_connection.request client.connection request
+    H2_async.Client.request client.connection request
       ~error_handler:(fun _ -> ())
       ~response_handler
   in

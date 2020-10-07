@@ -3,7 +3,7 @@
 (library
  (name dune_cache_daemon)
  (libraries async csexp dune-private-libs.cache dune-private-libs.stdune fmt
-   h2 logs lwt lwt.unix sexplib uri)
+   h2 h2-async logs lwt lwt.unix sexplib uri)
  (synopsis "Dune distributed binary artifacts cache")
  (preprocess
   (pps lwt_ppx)))
