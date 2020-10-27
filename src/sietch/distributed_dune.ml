@@ -19,13 +19,7 @@ type t =
   ; config : Config.t
   }
 
-and client =
-  { requests :
-      (Cohttp.Request.t * Cohttp_async.Body.t) Async_kernel.Pipe.Writer.t
-  ; responses :
-      (Cohttp.Response.t * Cohttp_async.Body.t) Async_kernel.Pipe.Reader.t
-  ; uri : Uri.t
-  }
+and client = Async.Rpc.Connection.t
 
 let make cache config = { cache; clients = Clients.empty; config }
 
@@ -35,13 +29,18 @@ let connect t uri =
   let () =
     debug [ Pp.textf "connect to distributed backend %S" (Uri.to_string uri) ]
   in
-  let host = Uri.with_uri ~path:None uri in
-  let requests_reader, requests = Async.Pipe.create () in
-  let* responses =
-    Cohttp_async.Client.callv host requests_reader
-    |> Async.Deferred.map ~f:Result.return
+  let* _, reader, writer =
+    Async.Tcp.connect @@ Async.Tcp.Where_to_connect.of_host_and_port
+    @@ Core.Host_and_port.of_string @@ Uri.to_string uri
+    |> async_ok
   in
-  let client = { requests; responses; uri } in
+  let* client =
+    Async.( >>| )
+      (Async.Rpc.Connection.create
+         ~connection_state:(fun _ -> ())
+         reader writer)
+      (Result.map_error ~f:Core.Exn.to_string)
+  in
   let* clients =
     Clients.add t.clients uri client
     |> Result.map_error ~f:(fun _ -> "duplicate client")
@@ -50,11 +49,6 @@ let connect t uri =
   in
   let () = t.clients <- clients in
   Async.Deferred.Result.return client
-
-let digest_of_str str =
-  match Digest.from_hex str with
-  | Some hash -> Async.Deferred.Result.return hash
-  | None -> Async.Deferred.Result.failf "invalid hash: %S" str
 
 let client t target =
   let find_target target =
@@ -71,103 +65,35 @@ let client t target =
   | Some client -> Async.Deferred.Result.return client
   | None -> connect t uri
 
-let mutex = ref (Async.Ivar.create_full (Result.Ok ()))
+let block_get t hash =
+  let* client = client t hash in
+  Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.block_get client
+    (Digest.to_string hash)
+  |> async_ok
 
-let call t target meth ?(headers = []) ?body path =
-  let* client = client t target in
-  let uri =
-    Uri.with_uri ~path:(Option.some @@ Uri.path client.uri ^ path) client.uri
-  and headers, body, encoding =
-    match body with
-    | Some body ->
-      ( Cohttp.Header.of_list
-        @@ (("Content-Type", "application/octet-stream") :: headers)
-      , body
-      , Cohttp.Transfer.Chunked )
-    | None ->
-      ( Cohttp.Header.of_list @@ (("Content-Length", "0") :: headers)
-      , Cohttp_async.Body.empty
-      , Cohttp.Transfer.Fixed 0L )
-  in
-  let lock = !mutex
-  and unlock = Async.Ivar.create () in
-  let () = mutex := unlock in
-  let* () =
-    let request = Cohttp.Request.make ~meth ~encoding ~headers uri in
-    Async.Pipe.write client.requests (request, body)
-    |> Async.Deferred.map ~f:Result.return
-  in
-  let* () = Async.Ivar.read lock in
-  let ( >>= ) = Async.( >>= ) in
-  Async.Pipe.read client.responses >>= function
-  | `Eof ->
-    let () =
-      Caml.Format.eprintf "FATAL EMPTY %s\n%!" (Digest.to_string target)
-    in
-    let () = Async.Ivar.fill unlock (Result.Ok ()) in
-    Async.Deferred.Result.fail "error during HTTP request: no response"
-  | `Ok (response, body) -> (
-    (let drain () =
-       Cohttp_async.Body.drain body |> Async.Deferred.map ~f:Result.return
-     in
-     let () = Async.Ivar.fill unlock (Result.Ok ()) in
-     let* () =
-       let headers = Cohttp.Response.headers response in
-       match Cohttp.Header.get headers "X-dune-hash" with
-       | Some hash ->
-         let* hash = digest_of_str hash in
-         if Poly.( = ) (Digest.compare hash target) Ordering.Eq then
-           Async.Deferred.Result.return ()
-         else
-           let* () = drain () in
-           Async.Deferred.Result.failf
-             "invalid hash for artifact: expected %s, effective %s"
-             (Digest.to_string target) (Digest.to_string hash)
-       | None -> Async.Deferred.Result.return ()
-     in
-     Async.Deferred.Result.return (response, body))
-    >>= function
-    | Result.Ok _ as res -> Async.return res
-    | Result.Error _e as error -> Async.return error )
+let block_has t hash =
+  let* client = client t hash in
+  Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.block_has client
+    (Digest.to_string hash)
+  |> async_ok
 
-let expect_status expected m path = function
-  | effective when List.exists ~f:(Poly.( = ) effective) expected ->
-    Result.Ok ()
-  | effective ->
-    Result.Error
-      (Fmt.str "unexpected %s on %s %s"
-         (Cohttp.Code.string_of_status effective)
-         (Cohttp.Code.string_of_method m)
-         path)
+let block_put t hash executable contents =
+  let* client = client t hash in
+  Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.block_put client
+    (Digest.to_string hash, executable, contents)
+  |> async_ok
 
-let put_contents t target path contents =
-  let body = Cohttp_async.Body.of_string contents in
-  let* response, body = call t target `PUT ~body path in
-  let* () =
-    Cohttp_async.Body.drain body |> Async.Deferred.map ~f:Result.return
-  in
-  Async.return
-  @@ expect_status [ `Created; `OK ] `PUT path (Cohttp.Response.status response)
+let index_get t name hash =
+  let* client = client t hash in
+  Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.index_get client
+    (name, Digest.to_string hash)
+  |> async_ok
 
-let get_file t target path local_path =
-  if Path.exists local_path then
-    debug
-      [ Pp.textf "artifact already present locally: %s"
-          (Path.to_string local_path)
-      ]
-    |> Async.Deferred.Result.return
-  else
-    let* response, body = call t target `GET path in
-    let* () =
-      expect_status [ `OK ] `GET path (Cohttp.Response.status response)
-      |> Async.return
-    in
-    let executable =
-      Poly.( = )
-        (Cohttp.Header.get (Cohttp.Response.headers response) "X-executable")
-        (Some "1")
-    in
-    write_file t.cache local_path executable (Cohttp_async.Body.to_pipe body)
+let index_put t name hash lines =
+  let* client = client t hash in
+  Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.index_put client
+    (name, Digest.to_string hash, lines)
+  |> async_ok
 
 let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
     =
@@ -177,54 +103,22 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
       | Files files ->
         let insert_file { Cache.File.digest; _ } =
           let path = Local.file_path cache digest in
-          let query ?(headers = []) ?body meth =
-            let path = "blocks/" ^ Digest.to_string digest in
-            let* status, body = call t digest meth ~headers ?body path in
-            let* () =
-              Cohttp_async.Body.drain body
-              |> Async.Deferred.map ~f:Result.return
-            in
-            Async.Deferred.Result.return status
-          in
           let insert stats input =
-            let body = Cohttp_async.Body.of_pipe @@ Async.Reader.pipe input
-            and headers =
-              let executable =
-                if stats.Unix.st_perm land 0o100 > 0 then
-                  "1"
-                else
-                  "0"
-              in
-              [ ("X-executable", executable)
-              ; ("Content-Length", Int.to_string stats.Unix.st_size)
-              ]
-            in
-
-            query ~headers `PUT ~body
+            let executable = stats.Unix.st_perm land 0o100 > 0 in
+            let* contents = Async.Reader.contents input |> async_ok in
+            block_put t digest executable contents
           in
           let stats = Path.stat path in
           let* upload =
             if stats.st_size < 4096 then
               Async.Deferred.Result.return true
             else
-              let* status = query `HEAD in
-              let status = Cohttp.Response.status status in
-              let* () =
-                Async.return
-                @@ expect_status [ `OK; `No_content ] `HEAD
-                     (Path.to_string path) status
-              in
-              Async.Deferred.Result.return (Poly.( = ) status `No_content)
+              block_has t digest
           in
           if upload then
-            let* response =
-              let path = Path.to_string path in
-              let () = debug [ Pp.textf "distribute %S" path ] in
-              Async.Reader.with_file path ~f:(insert stats)
-            in
-            Async.return
-            @@ expect_status [ `Created; `OK ] `PUT (Path.to_string path)
-                 (Cohttp.Response.status response)
+            let path = Path.to_string path in
+            let () = debug [ Pp.textf "distribute %S" path ] in
+            Async.Reader.with_file path ~f:(insert stats)
           else
             Async.Deferred.Result.return ()
         in
@@ -238,9 +132,7 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
         Async.Deferred.Result.return ()
       | Value _ -> Async.Deferred.Result.fail "ignoring Jenga value"
     in
-    put_contents t key
-      ("blocks/" ^ Digest.to_string key)
-      (Cache.Local.Metadata_file.to_string metadata)
+    block_put t key false (Cache.Local.Metadata_file.to_string metadata)
   in
   let ( >>| ) = Async.Deferred.( >>| ) in
   Async.try_with ~extract_exn:true f >>| function
@@ -259,46 +151,52 @@ let prefetch ({ cache; _ } as t) count i key =
       |> Async.Deferred.Result.return
     else
       let hash = Digest.to_string key in
-      let path = "blocks/" ^ hash in
       let () = debug [ Pp.textf "fetch metadata %s (%i/%i)" hash i count ] in
-      let* response, body =
-        let* status, body = call t key `GET path in
-        let* body =
-          Cohttp_async.Body.to_string body
-          |> Async.Deferred.map ~f:Result.return
-        in
-        Async.Deferred.Result.return (status, body)
-      in
-      let status = Cohttp.Response.status response in
-      let* () =
-        expect_status [ `OK; `No_content ] `GET path status |> Async.return
-      in
-      if Poly.( = ) status `No_content then
-        Async.Deferred.Result.return ()
-      else
+      block_get t key >>= function
+      | None -> Async.Deferred.Result.return ()
+      | Some (metadata_contents, _) -> (
         let* metadata =
-          Cache.Local.Metadata_file.of_string body |> Async.return
+          Cache.Local.Metadata_file.of_string metadata_contents |> Async.return
         in
         match metadata.contents with
         | Files files ->
           let fetch { Cache.File.digest; _ } =
-            let () =
-              debug [ Pp.textf "fetch artifact %s" (Digest.to_string digest) ]
-            in
-            get_file t digest
-              ("blocks/" ^ Digest.to_string digest)
-              (Local.file_path cache digest)
+            let path = Local.file_path cache digest in
+            if Path.exists local_path then
+              debug
+                [ Pp.textf "artifact already present locally: %s"
+                    (Path.to_string local_path)
+                ]
+              |> Async.Deferred.Result.return
+            else
+              let () =
+                debug [ Pp.textf "fetch artifact %s" (Digest.to_string digest) ]
+              in
+              block_get t digest >>= function
+              | None -> Async.Deferred.Result.return ()
+              | Some (contents, executable) ->
+                let perm =
+                  if executable then
+                    0o500
+                  else
+                    0o400
+                in
+                Async.Writer.with_file_atomic ~perm (Path.to_string path)
+                  ~f:(fun writer ->
+                    let () = Async.Writer.write writer contents in
+                    Async.Writer.flushed writer)
+                |> async_ok
           in
           let ( let* ) = Async.Deferred.( >>= ) in
           let* results = Async.Deferred.List.all @@ List.map ~f:fetch files in
           let ( let* ) = Async.Deferred.Result.( >>= ) in
           let* (_ : unit list) = results |> Result.List.all |> Async.return in
-          write_file cache local_path false (Async.Pipe.of_list [ body ])
+          write_file cache local_path false metadata_contents
         | Value h ->
           let () =
             debug [ Pp.textf "skipping Jenga value: %s" (Digest.to_string h) ]
           in
-          Async.Deferred.Result.return ()
+          Async.Deferred.Result.return () )
   in
   let ( >>| ) = Async.Deferred.( >>| ) in
   Async.try_with ~extract_exn:true f >>| function
@@ -306,14 +204,9 @@ let prefetch ({ cache; _ } as t) count i key =
   | Result.Error e ->
     Code_error.raise "prefetch fatal error" [ ("exception", Exn.to_dyn e) ]
 
-let index_path name key =
-  String.concat ~sep:"/" [ "index"; name; Digest.to_string key ]
-
 let index_add t name key keys =
-  let f () =
-    put_contents t key (index_path name key)
-      (String.concat ~sep:"\n" (List.map ~f:Digest.to_string keys))
-  in
+  let keys = List.map ~f:Digest.to_string keys in
+  let f () = index_put t name key keys in
   let ( >>| ) = Async.Deferred.( >>| ) in
   Async.try_with ~extract_exn:true f >>| function
   | Result.Ok v -> v
@@ -322,21 +215,9 @@ let index_add t name key keys =
 
 let index_prefetch t name key =
   let f () =
-    let path = index_path name key in
-    let* response, body = call t key `GET path in
-    let status = Cohttp.Response.status response in
-    let* body =
-      (* FIXME: parse the index file on the fly instead of dumping in to memory *)
-      Cohttp_async.Body.to_string body |> Async.Deferred.map ~f:Result.return
-    in
-    let* () =
-      expect_status [ `OK; `No_content ] `GET path status |> Async.return
-    in
-    if Poly.( = ) status `OK then
-      let keys =
-        String.split ~on:'\n' body
-        |> List.filter_map ~f:(fun d -> Digest.from_hex d)
-      in
+    index_get t name key >>= function
+    | Some lines ->
+      let keys = List.filter_map ~f:(fun d -> Digest.from_hex d) lines in
       let count = List.length keys in
       let ( let* ) = Async.Deferred.( >>= ) in
       let* results =
@@ -346,8 +227,7 @@ let index_prefetch t name key =
       let ( let* ) = Async.Deferred.Result.( >>= ) in
       let* (_ : unit list) = Result.List.all results |> Async.return in
       Async.Deferred.Result.return ()
-    else
-      Async.Deferred.Result.return ()
+    | None -> Async.Deferred.Result.return ()
   in
   let ( >>= ) = Async.Deferred.( >>= ) in
   let start = Unix.time () in

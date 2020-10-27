@@ -21,6 +21,7 @@
  (name dune-cache-daemon)
  (synopsis "Dune distributed cache daemon")
  (depends
+  async
   (dune-private-libs
    (>= 2.4.0))
   (csexp
@@ -29,10 +30,9 @@
   cohttp
   cohttp-lwt-unix
   httpaf
-  httpaf-lwt-unix
+  httpaf-async-unix
   logs
-  lwt
-  lwt_ppx
+  logs-async
   (ocamlformat
    (and
     (= 0.15.0)

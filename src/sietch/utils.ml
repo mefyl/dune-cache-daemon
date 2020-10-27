@@ -13,6 +13,8 @@ let ( let* ) = ( >>= )
 
 let ( let+ ) = ( >>| )
 
+let async_ok = Async.Deferred.map ~f:Result.return
+
 let int_of_string ?where s =
   match Int.of_string s with
   | Some s -> Ok s
@@ -113,9 +115,11 @@ let mkdir p =
 
 (** Write file in an atomic manner. *)
 let write_file local path executable contents =
+  let ( >>= ) = Async.Deferred.( >>= )
+  and ( let* ) = Async.Deferred.( >>= ) in
   let f () =
     let dir = path |> Path.parent_exn |> Path.to_string
-    and path_tmp =
+    and temp_file =
       path |> Path.basename |> Path.relative (Local.tmp local) |> Path.to_string
     and path = path |> Path.to_string
     and perm =
@@ -124,20 +128,11 @@ let write_file local path executable contents =
       else
         0o400
     in
-    let ( let* ) = Async.Deferred.( >>= )
-    and ( and* ) = Async.Deferred.both in
-    let* () =
-      let write () =
-        let* output = Async.Writer.open_file ~perm path_tmp in
-        let pipe = Async.Writer.pipe output in
-        let* () = Async.Pipe.transfer contents pipe ~f:Base.Fn.id in
-        Async.Writer.close output
-      in
-      Local.throttle_fd local write
-    and* () = mkdir dir in
-    Async.Unix.rename ~src:path_tmp ~dst:path
+    let* () = mkdir dir in
+    Async.Writer.with_file_atomic ~temp_file ~perm path ~f:(fun writer ->
+        let () = Async.Writer.write writer contents in
+        Async.Writer.flushed writer)
   in
-  let ( >>= ) = Async.Deferred.( >>= ) in
   Async.try_with ~extract_exn:true f >>= function
   | Result.Ok () -> Async.Deferred.Result.return ()
   | Result.Error (Unix.Unix_error (Unix.EACCES, _, _)) ->
