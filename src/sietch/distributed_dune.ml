@@ -109,18 +109,18 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
             block_put t digest executable contents
           in
           let stats = Path.stat path in
-          let* upload =
+          let* skip =
             if stats.st_size < 4096 then
-              Async.Deferred.Result.return true
+              Async.Deferred.Result.return false
             else
               block_has t digest
           in
-          if upload then
+          if skip then
+            Async.Deferred.Result.return ()
+          else
             let path = Path.to_string path in
             let () = debug [ Pp.textf "distribute %S" path ] in
             Async.Reader.with_file path ~f:(insert stats)
-          else
-            Async.Deferred.Result.return ()
         in
         let ( let* ) = Async.Deferred.( >>= ) in
         let* results =
