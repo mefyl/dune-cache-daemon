@@ -13,6 +13,11 @@ let ( let* ) = ( >>= )
 
 let ( let+ ) = ( >>| )
 
+let ( and+ ) l r =
+  let* l = l in
+  let+ r = r in
+  (l, r)
+
 let async_ok = Async.Deferred.map ~f:Result.return
 
 let int_of_string ?where s =
