@@ -78,7 +78,7 @@ let connect t uri =
   let () = t.clients <- clients in
   Async.Deferred.Result.return client
 
-let client t target =
+let client_and_uri t target =
   let find_target target =
     let f node = Config.ranges_include node.Config.space target in
     match List.find t.config.nodes ~f with
@@ -89,9 +89,14 @@ let client t target =
            (Digest.to_string target))
   in
   let* uri = find_target target |> Async.return in
-  match Clients.find t.clients uri with
-  | Some client -> Async.Deferred.Result.return client
-  | None -> connect t uri
+  let+ client =
+    match Clients.find t.clients uri with
+    | Some client -> Async.Deferred.Result.return client
+    | None -> connect t uri
+  in
+  (client, uri)
+
+let client t target = client_and_uri t target >>| fst
 
 let block_get t hash =
   let* client = client t hash in
@@ -123,11 +128,31 @@ let index_put t name hash lines =
     (name, Digest.to_string hash, lines)
   |> async_ok
 
-let metadata_put t hash metadata =
-  let* client = client t hash in
-  Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.metadata_put client
-    (Digest.to_string hash, Cache.Local.Metadata_file.to_string metadata)
-  |> async_ok
+let metadata_put t hash (metadata : Cache.Local.Metadata_file.t) =
+  let* targets =
+    let ( let* ) = Async.( >>= ) in
+    let* init =
+      let+ client, uri = client_and_uri t hash in
+      Clients.set Clients.empty uri client
+    in
+    let f init { Cache.File.digest; _ } =
+      match init with
+      | Result.Ok init ->
+        let+ client, uri = client_and_uri t digest in
+        Clients.set init uri client
+      | Result.Error e -> Async.Deferred.Result.fail e
+    in
+    match metadata.contents with
+    | Value v ->
+      let+ client, uri = client_and_uri t v in
+      Clients.set Clients.empty uri client
+    | Files files -> Async.Deferred.List.fold ~f ~init files
+  in
+  let f (_, client) =
+    Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.metadata_put client
+      (Digest.to_string hash, Cache.Local.Metadata_file.to_string metadata)
+  in
+  Async.Deferred.List.iter ~f (Clients.to_list targets) |> async_ok
 
 let distribute t key (metadata : Cache.Local.Metadata_file.t) =
   let f () = metadata_put t key metadata in
