@@ -22,6 +22,7 @@
  (synopsis "Dune distributed cache daemon")
  (depends
   async
+  dune-distributed-storage
   (dune-private-libs
    (>= 2.4.0))
   (csexp
