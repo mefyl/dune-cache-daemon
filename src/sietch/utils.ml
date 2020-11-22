@@ -119,7 +119,7 @@ let mkdir p =
   | Result.Error e -> raise e
 
 (** Write file in an atomic manner. *)
-let write_file local path executable contents =
+let write_file local path executable ~f =
   let ( >>= ) = Async.Deferred.( >>= )
   and ( let* ) = Async.Deferred.( >>= ) in
   let f () =
@@ -132,11 +132,12 @@ let write_file local path executable contents =
         0o500
       else
         0o400
+    and f writer =
+      Async.Deferred.bind (f writer) ~f:(fun () -> Async.Writer.flushed writer)
     in
+
     let* () = mkdir dir in
-    Async.Writer.with_file_atomic ~temp_file ~perm path ~f:(fun writer ->
-        let () = Async.Writer.write writer contents in
-        Async.Writer.flushed writer)
+    Async.Writer.with_file_atomic ~temp_file ~perm path ~f
   in
   Async.try_with ~extract_exn:true f >>= function
   | Result.Ok () -> Async.Deferred.Result.return ()

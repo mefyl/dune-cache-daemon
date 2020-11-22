@@ -48,15 +48,21 @@ let connect t uri =
           let ( let+ ) = Async.( >>| ) in
           let ( and+ ) = Async.Deferred.both in
           let+ stats = Async.Unix.stat path
-          and+ contents = Async.Reader.file_contents path in
-          (contents, stats.perm land 0o100 <> 0)
+          and+ contents = Async.Reader.open_file path in
+          Async.Pipe.concat
+            [ Async.Pipe.of_list
+                [ Core.Either.second (stats.perm land 0o100 <> 0) ]
+            ; Async.Pipe.map ~f:Core.Either.first (Async.Reader.pipe contents)
+            ]
         in
-        Async.Deferred.map ~f:Result.to_option @@ Async.try_with f
+        Async.Deferred.map (Async.try_with f)
+          ~f:(Result.map_error ~f:(fun _ -> ()))
       in
       match
         Async.Rpc.Implementations.create
           ~implementations:
-            [ Async.Rpc.Rpc.implement Dune_distributed_storage.Rpc.block_get get
+            [ Async.Rpc.Pipe_rpc.implement
+                Dune_distributed_storage.Rpc.block_get get
             ]
           ~on_unknown_rpc:`Raise
       with
@@ -100,9 +106,10 @@ let client t target = client_and_uri t target >>| fst
 
 let block_get t hash =
   let* client = client t hash in
-  Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.block_get client
+  let ( >>= ) = Async.( >>= ) in
+  Async.Rpc.Pipe_rpc.dispatch Dune_distributed_storage.Rpc.block_get client
     (Digest.to_string hash)
-  |> async_ok
+  >>= Dune_distributed_storage.Rpc.decode_block_get |> async_ok
 
 let _block_has t hash =
   let* client = client t hash in
@@ -177,6 +184,12 @@ let prefetch ({ cache; _ } as t) count i key =
       block_get t key >>= function
       | None -> Async.Deferred.Result.return ()
       | Some (metadata_contents, _) -> (
+        let* metadata_contents =
+          Async.Pipe.fold ~init:""
+            ~f:(fun l r -> Async.return (l ^ r))
+            metadata_contents
+          |> async_ok
+        in
         let* metadata =
           Cache.Local.Metadata_file.of_string metadata_contents |> Async.return
         in
@@ -197,13 +210,18 @@ let prefetch ({ cache; _ } as t) count i key =
               block_get t digest >>= function
               | None -> Async.Deferred.Result.return ()
               | Some (contents, executable) ->
-                write_file cache path executable contents
+                let f writer =
+                  Async.Pipe.transfer ~f:Core.Fn.id contents
+                    (Async.Writer.pipe writer)
+                in
+                write_file cache path executable ~f
           in
           let ( let* ) = Async.Deferred.( >>= ) in
           let* results = Async.Deferred.List.all @@ List.map ~f:fetch files in
           let ( let* ) = Async.Deferred.Result.( >>= ) in
           let* (_ : unit list) = results |> Result.List.all |> Async.return in
-          write_file cache local_path false metadata_contents
+          write_file cache local_path false ~f:(fun writer ->
+              Async.return @@ Async.Writer.write writer metadata_contents)
         | Value h ->
           let () =
             debug [ Pp.textf "skipping Jenga value: %s" (Digest.to_string h) ]
