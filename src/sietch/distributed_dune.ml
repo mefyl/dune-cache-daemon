@@ -110,18 +110,6 @@ let block_get t hash =
     (Digest.to_string hash)
   >>= Dune_distributed_storage.Rpc.decode_block_get |> async_ok
 
-let _block_has t hash =
-  let* client = client t hash in
-  Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.block_has client
-    (Digest.to_string hash)
-  |> async_ok
-
-let _block_put t hash executable contents =
-  let* client = client t hash in
-  Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.block_put client
-    (Digest.to_string hash, executable, contents)
-  |> async_ok
-
 let index_get t name hash =
   let* client = client t hash in
   Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.index_get client
