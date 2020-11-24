@@ -49,11 +49,9 @@ let connect t uri =
           let ( and+ ) = Async.Deferred.both in
           let+ stats = Async.Unix.stat path
           and+ contents = Async.Reader.open_file path in
-          Async.Pipe.concat
-            [ Async.Pipe.of_list
-                [ Core.Either.second (stats.perm land 0o100 <> 0) ]
-            ; Async.Pipe.map ~f:Core.Either.first (Async.Reader.pipe contents)
-            ]
+          Dune_distributed_storage.Rpc.encode_block_get
+            (stats.perm land 0o100 <> 0)
+            (Async.Reader.pipe contents)
         in
         Async.Deferred.map (Async.try_with f)
           ~f:(Result.map_error ~f:(fun _ -> ()))
