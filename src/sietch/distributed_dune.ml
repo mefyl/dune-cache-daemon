@@ -50,8 +50,9 @@ let connect t uri =
           let+ stats = Async.Unix.stat path
           and+ contents = Async.Reader.open_file path in
           Dune_distributed_storage.Rpc.encode_block_get
-            (stats.perm land 0o100 <> 0)
-            (Async.Reader.pipe contents)
+            { executable = stats.perm land 0o100 <> 0
+            ; contents = Async.Reader.pipe contents
+            }
         in
         Async.Deferred.map (Async.try_with f)
           ~f:(Result.map_error ~f:(fun _ -> ()))
@@ -172,7 +173,7 @@ let prefetch ({ cache; _ } as t) count i key =
       let () = debug [ Pp.textf "fetch metadata %s (%i/%i)" hash i count ] in
       block_get t key >>= function
       | None -> Async.Deferred.Result.return ()
-      | Some (metadata_contents, _) -> (
+      | Some { contents = metadata_contents; _ } -> (
         let* metadata_contents =
           Async.Pipe.fold ~init:""
             ~f:(fun l r -> Async.return (l ^ r))
@@ -198,7 +199,7 @@ let prefetch ({ cache; _ } as t) count i key =
               in
               block_get t digest >>= function
               | None -> Async.Deferred.Result.return ()
-              | Some (contents, executable) ->
+              | Some { contents; executable } ->
                 let f writer =
                   Async.Pipe.transfer ~f:Core.Fn.id contents
                     (Async.Writer.pipe writer)
