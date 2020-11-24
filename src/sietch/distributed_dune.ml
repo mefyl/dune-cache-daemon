@@ -65,7 +65,8 @@ let connect t uri =
           ~on_unknown_rpc:`Raise
       with
       | Result.Ok impls -> impls
-      | Result.Error _ -> failwith "duplicate implementations"
+      | Result.Error (`Duplicate_implementations _) ->
+        failwith "duplicate implementations"
     in
     Async.( >>| )
       (Async.Rpc.Connection.create
