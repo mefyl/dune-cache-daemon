@@ -25,7 +25,7 @@ let make cache config = { cache; clients = Clients.empty; config }
 
 let debug = Dune_util.Log.info
 
-let hash h =
+let digest_from_hex_exn h =
   match Digest.from_hex h with
   | None -> failwith "invalid hash"
   | Some h -> h
@@ -42,7 +42,7 @@ let connect t uri =
   let* client =
     let implementations =
       let get () h =
-        let hash = hash h in
+        let hash = digest_from_hex_exn h in
         let path = Local.file_path t.cache hash |> Path.to_string in
         let f () =
           let ( let+ ) = Async.( >>| ) in
