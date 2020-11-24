@@ -123,24 +123,26 @@ let index_put t name hash lines =
   |> async_ok
 
 let metadata_put t hash (metadata : Cache.Local.Metadata_file.t) =
+  (* Determine all nodes we need to upload metadata to *)
   let* targets =
     let ( let* ) = Async.( >>= ) in
     let* init =
+      (* Send metadata to the node that will actually store it *)
       let+ client, uri = client_and_uri t hash in
       Clients.set Clients.empty uri client
     in
-    let f init { Cache.File.digest; _ } =
-      match init with
-      | Result.Ok init ->
-        let+ client, uri = client_and_uri t digest in
-        Clients.set init uri client
-      | Result.Error e -> Async.Deferred.Result.fail e
-    in
     match metadata.contents with
-    | Value v ->
-      let+ client, uri = client_and_uri t v in
-      Clients.set Clients.empty uri client
-    | Files files -> Async.Deferred.List.fold ~f ~init files
+    | Value _ -> Async.Deferred.return init
+    | Files files ->
+      (* Send metadata to all nodes that must store one of its artifacts *)
+      let f init { Cache.File.digest; _ } =
+        match init with
+        | Result.Ok init ->
+          let+ client, uri = client_and_uri t digest in
+          Clients.set init uri client
+        | Result.Error e -> Async.Deferred.Result.fail e
+      in
+      Async.Deferred.List.fold ~f ~init files
   in
   let f (_, client) =
     Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.metadata_put client
