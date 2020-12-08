@@ -14,7 +14,7 @@ type error =
 
 val make :
      ?root:Path.t
-  -> ?distribution:(Cache.Local.t -> (module Distributed.S))
+  -> ?distribution:(Local.t -> (module Distributed.S))
   -> config:config
   -> unit
   -> (t, error) Async.Deferred.Result.t
@@ -38,7 +38,7 @@ val endpoint : t -> string option
 
 val daemon :
      root:Path.t
-  -> ?distribution:(Cache.Local.t -> (module Distributed.S))
+  -> ?distribution:(Local.t -> (module Distributed.S))
   -> config:config
   -> (string -> unit)
   -> unit

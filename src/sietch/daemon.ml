@@ -14,7 +14,7 @@ type error =
   ]
 
 type client =
-  { cache : Cache.Local.t
+  { cache : Local.t
   ; commits : Digest.t list array
   ; common_metadata : Sexp.t list
   ; socket : [ `Active ] socket
@@ -174,7 +174,7 @@ let make ?root ?(distribution = Distributed.disabled) ~config () =
   | Result.Error msg -> Async.Deferred.Result.fail (`Local_cache_error msg)
   | Result.Ok cache ->
     let events, push_event = Async.Pipe.create ()
-    and distributed = distribution cache in
+    and distributed = distribution (Local.make cache) in
     Async.Deferred.Result.return
       { root = Option.value root ~default:(Cache.Local.default_root ())
       ; socket = None
@@ -292,16 +292,16 @@ let client_thread daemon client =
         ->
         let metadata = metadata @ client.common_metadata in
         let* metadata, _ =
-          Cache.Local.promote_sync client.cache files key metadata ~repository
+          Local.promote_sync client.cache files key metadata ~repository
             ~duplication
-          |> Result.map_error ~f:(fun e -> `Distribution_error e)
-          |> Async.return
+          |> Async.Deferred.map
+               ~f:(Result.map_error ~f:(fun e -> `Distribution_error e))
         in
         let () = promoted metadata promotion in
         Async.Deferred.Result.return client
       | Promoted ({ key; _ } as promotion) ->
         let* metadata =
-          let path = Cache.Local.metadata_path client.cache key in
+          let path = Local.metadata_path client.cache key in
           let* sexp =
             try
               Io.read_file path |> Csexp.parse_string
@@ -323,7 +323,7 @@ let client_thread daemon client =
       | SetBuildRoot root ->
         let res =
           let open Result.O in
-          let+ cache = Cache.Local.set_build_dir client.cache root in
+          let+ cache = Local.set_build_dir client.cache root in
           { client with cache }
         in
         res
@@ -332,40 +332,40 @@ let client_thread daemon client =
       | SetCommonMetadata metadata ->
         Async.Deferred.Result.return { client with common_metadata = metadata }
       | SetRepos repositories ->
-        let () =
-          let f () =
-            let module D = (val daemon.distributed) in
-            let f (repository : Cache.repository) =
-              let hash = Digest.string repository.commit in
-              let () =
-                info
-                  [ Pp.textf "prefetch commit %S (%S)" repository.commit
-                      (Digest.to_string hash)
-                  ]
-              in
-              let+ () = D.index_prefetch commits_index_key hash in
-              info
-                [ Pp.textf "done prefetching commit %S (%S)" repository.commit
-                    (Digest.to_string hash)
-                ]
-            in
-            let open Async in
-            Async.Deferred.List.map ~f repositories >>= fun results ->
-            match Result.List.all results with
-            | Result.Ok (_ : unit list) -> Async.return ()
-            | Result.Error e ->
-              info
-                [ Pp.textf "error while prefetching index %s: %s"
-                    commits_index_key e
-                ];
-              Async.return ()
-          in
-          Async.don't_wait_for
-          @@ Low_priority.with_high_priority ~f daemon.distribution_barrier
-        in
+        (* let () =
+         *   let f () =
+         *     let module D = (val daemon.distributed) in
+         *     let f (repository : Cache.repository) =
+         *       let hash = Digest.string repository.commit in
+         *       let () =
+         *         info
+         *           [ Pp.textf "prefetch commit %S (%S)" repository.commit
+         *               (Digest.to_string hash)
+         *           ]
+         *       in
+         *       let+ () = D.index_prefetch commits_index_key hash in
+         *       info
+         *         [ Pp.textf "done prefetching commit %S (%S)" repository.commit
+         *             (Digest.to_string hash)
+         *         ]
+         *     in
+         *     let open Async in
+         *     Async.Deferred.List.map ~f repositories >>= fun results ->
+         *     match Result.List.all results with
+         *     | Result.Ok (_ : unit list) -> Async.return ()
+         *     | Result.Error e ->
+         *       info
+         *         [ Pp.textf "error while prefetching index %s: %s"
+         *             commits_index_key e
+         *         ];
+         *       Async.return ()
+         *   in
+         *   Async.don't_wait_for
+         *   @@ Low_priority.with_high_priority ~f daemon.distribution_barrier
+         * in *)
         let* client = index_commits daemon client in
         let* cache =
-          Cache.Local.with_repositories client.cache repositories
+          Local.with_repositories client.cache repositories
           |> Result.map_error ~f:(fun s -> `Remote_cache_error s)
           |> Async.return
         in
@@ -412,7 +412,7 @@ let client_thread daemon client =
       debug [ Pp.textf "%s: cleanup" (peer_name client.peer) ];
       let ( let* ) = Async.Deferred.( >>= ) in
       let* () = close_client_socket client.socket in
-      let () = Cache.Local.teardown client.cache in
+      let () = Local.teardown client.cache in
       Async.Pipe.write daemon.push_event (Client_left client.socket)
     in
     let ( >>| ) = Async.( >>| ) in
@@ -590,7 +590,7 @@ let run ?(endpoint_f = ignore) ?endpoint ?(trim_period = 10 * 60)
             | Result.Ok m -> m
             | Result.Error e -> User_error.raise [ Pp.textf "%s" e ]
           in
-          { cache
+          { cache = Local.make cache
           ; commits = [||]
           ; common_metadata = []
           ; socket

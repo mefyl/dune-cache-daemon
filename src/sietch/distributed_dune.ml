@@ -109,7 +109,11 @@ let block_get t hash =
   >>= function
   | Result.Ok (Result.Ok (executable, contents, _)) ->
     Async.Deferred.Result.return (executable, contents)
-  | _ ->
+  | Result.Error e ->
+    Async.Deferred.Result.fail
+      (Fmt.str "unable to fetch %s: %s" (Digest.to_string hash)
+         (Core.Error.to_string_hum e))
+  | Result.Ok (Result.Error ()) ->
     Async.Deferred.Result.fail
       (Fmt.str "unable to fetch %s" (Digest.to_string hash))
 
@@ -163,15 +167,12 @@ let distribute t key (metadata : Cache.Local.Metadata_file.t) =
 
 let prefetch ({ cache; _ } as t) count i key =
   let f () =
+    let hash = Digest.to_string key in
     let local_path = Local.metadata_path cache key in
     if Path.exists local_path then
-      debug
-        [ Pp.textf "metadata file already present locally: %s"
-            (Path.to_string local_path)
-        ]
+      debug [ Pp.textf "metadata %s: already present locally" hash ]
       |> Async.Deferred.Result.return
     else
-      let hash = Digest.to_string key in
       let () = debug [ Pp.textf "fetch metadata %s (%i/%i)" hash i count ] in
       let* _, metadata_contents = block_get t key in
       let* metadata_contents =
@@ -187,12 +188,15 @@ let prefetch ({ cache; _ } as t) count i key =
       | Files files ->
         let fetch { Cache.File.digest; _ } =
           let path = Local.file_path cache digest in
-          if Path.exists local_path then
-            debug
-              [ Pp.textf "artifact already present locally: %s"
-                  (Path.to_string local_path)
-              ]
-            |> Async.Deferred.Result.return
+          if Path.exists path then
+            let+ () =
+              debug
+                [ Pp.textf "artifact already present locally: %s"
+                    (Path.to_string path)
+                ]
+              |> Async.Deferred.Result.return
+            in
+            false
           else
             let () =
               debug [ Pp.textf "fetch artifact %s" (Digest.to_string digest) ]
@@ -207,9 +211,31 @@ let prefetch ({ cache; _ } as t) count i key =
         let ( let* ) = Async.Deferred.( >>= ) in
         let* results = Async.Deferred.List.all @@ List.map ~f:fetch files in
         let ( let* ) = Async.Deferred.Result.( >>= ) in
-        let* (_ : unit list) = results |> Result.List.all |> Async.return in
-        write_file cache local_path false ~f:(fun writer ->
-            Async.return @@ Async.Writer.write writer metadata_contents)
+        let* results = results |> Result.List.all |> Async.return in
+        let+ result_metadata =
+          write_file cache local_path false ~f:(fun writer ->
+              Async.return @@ Async.Writer.write writer metadata_contents)
+        in
+        if result_metadata then
+          debug [ Pp.textf "metadata %s: rule was built in the meantime" hash ]
+        else
+          let count =
+            List.fold_left ~init:0
+              ~f:(fun a b ->
+                if b then
+                  a + 1
+                else
+                  a)
+              results
+          and length = List.length results in
+          if count = length then
+            debug
+              [ Pp.textf "metadata %s: all %i artifacts downloaded" hash count ]
+          else
+            debug
+              [ Pp.textf "metadata %s: %i / %i artifacts downloaded" hash count
+                  length
+              ]
       | Value h ->
         let () =
           debug [ Pp.textf "skipping Jenga value: %s" (Digest.to_string h) ]
@@ -269,9 +295,7 @@ let index_prefetch t name key =
 
 let make config local =
   ( module struct
-    let v =
-      let local = Local.make local in
-      make local config
+    let v = make local config
 
     let distribute = distribute v
 

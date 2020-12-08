@@ -42,9 +42,9 @@ depends: [
   "jst-config" {= "v0.14.0"}
   "logs" {= "0.7.0"}
   "logs-async" {= "1.1"}
-  "menhir" {= "20200624"}
-  "menhirLib" {= "20200624"}
-  "menhirSdk" {= "20200624"}
+  "menhir" {= "20201122"}
+  "menhirLib" {= "20201122"}
+  "menhirSdk" {= "20201122"}
   "num" {= "1.4"}
   "ocaml" {= "4.10.0"}
   "ocaml-compiler-libs" {= "v0.12.3"}

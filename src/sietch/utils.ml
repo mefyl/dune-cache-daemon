@@ -118,7 +118,9 @@ let mkdir p =
   | Result.Error (Unix.Unix_error (Unix.EEXIST, _, _)) -> ()
   | Result.Error e -> raise e
 
-(** Write file in an atomic manner. *)
+(** Write file in an atomic manner. Return whether the new file was eventually
+    moved, which can be false if another process created the destination in the
+    meantime. *)
 let write_file local path executable ~f =
   let ( >>= ) = Async.Deferred.( >>= )
   and ( let* ) = Async.Deferred.( >>= ) in
@@ -135,16 +137,16 @@ let write_file local path executable ~f =
     and f writer =
       Async.Deferred.bind (f writer) ~f:(fun () -> Async.Writer.flushed writer)
     in
-
     let* () = mkdir dir in
-    Async.Writer.with_file_atomic ~temp_file ~perm path ~f
+    Local.throttle_fd local (fun () ->
+        Async.Writer.with_file_atomic ~temp_file ~perm path ~f)
   in
   Async.try_with ~extract_exn:true f >>= function
-  | Result.Ok () -> Async.Deferred.Result.return ()
+  | Result.Ok () -> Async.Deferred.Result.return true
   | Result.Error (Unix.Unix_error (Unix.EACCES, _, _)) ->
     (* If the file exists with no write permissions, it is being pulled as part
        of another hinting. *)
-    Async.Deferred.Result.return ()
+    Async.Deferred.Result.return false
   | Result.Error (Unix.Unix_error (e, f, a)) ->
     Async.Deferred.Result.fail
       (Printf.sprintf "%s: %s %s" (Unix.error_message e) f a)

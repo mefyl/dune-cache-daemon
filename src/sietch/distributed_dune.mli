@@ -1,1 +1,1 @@
-val make : Config.t -> Cache.Local.t -> (module Distributed.S)
+val make : Config.t -> Local.t -> (module Distributed.S)
